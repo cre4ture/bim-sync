@@ -1,6 +1,6 @@
-# raw-image-sync
+# bim-sync
 
-`raw-image-sync` incrementally syncs a raw disk image file to a Windows physical disk, such as an SD card.
+`bim-sync` incrementally syncs a raw disk image file to a Windows physical disk, such as an SD card.
 
 It compares the image and target disk block by block, writes only blocks that differ, and optionally verifies written blocks by reading them back.
 
@@ -34,7 +34,7 @@ Always verify the target disk before writing.
 ## Project Layout
 
 ```text
-raw-image-sync/
+bim-sync/
 |-- Cargo.toml
 `-- src/
     `-- main.rs
@@ -49,7 +49,7 @@ cargo build --release
 The executable will be created at:
 
 ```text
-.\target\release\raw-image-sync.exe
+.\target\release\bim-sync.exe
 ```
 
 ## Find The Correct Disk Number
@@ -102,7 +102,7 @@ Replace `1` with the correct disk number.
 To compare the image with the SD card without writing anything:
 
 ```powershell
-.\target\release\raw-image-sync.exe --image C:\path\sdcard.img --disk 1 --verify-only
+.\target\release\bim-sync.exe --image C:\path\sdcard.img --disk 1 --verify-only
 ```
 
 This reports differing blocks but does not modify the target disk.
@@ -112,7 +112,7 @@ This reports differing blocks but does not modify the target disk.
 To write only changed blocks and verify each written block:
 
 ```powershell
-.\target\release\raw-image-sync.exe --image C:\path\sdcard.img --disk 1
+.\target\release\bim-sync.exe --image C:\path\sdcard.img --disk 1
 ```
 
 ## Skip Write Verification
@@ -122,7 +122,7 @@ By default, changed blocks are verified after writing.
 To skip read-after-write verification:
 
 ```powershell
-.\target\release\raw-image-sync.exe --image C:\path\sdcard.img --disk 1 --no-verify-writes
+.\target\release\bim-sync.exe --image C:\path\sdcard.img --disk 1 --no-verify-writes
 ```
 
 Skipping verification may be faster, but it is less safe.
@@ -134,7 +134,7 @@ The default block size is 4 MiB.
 To use a larger block size, for example 16 MiB:
 
 ```powershell
-.\target\release\raw-image-sync.exe --image C:\path\sdcard.img --disk 1 --block-size-mib 16
+.\target\release\bim-sync.exe --image C:\path\sdcard.img --disk 1 --block-size-mib 16
 ```
 
 Larger blocks may improve throughput but can cause more data to be rewritten when only a small part of a block changed.
@@ -162,8 +162,8 @@ Get-Disk | Select-Object Number,FriendlyName,Size,BusType,IsBoot,IsSystem
 Set-Disk -Number 1 -IsOffline $true
 Set-Disk -Number 1 -IsReadOnly $false
 
-.\target\release\raw-image-sync.exe --image C:\images\sdcard.img --disk 1 --verify-only
-.\target\release\raw-image-sync.exe --image C:\images\sdcard.img --disk 1
+.\target\release\bim-sync.exe --image C:\images\sdcard.img --disk 1 --verify-only
+.\target\release\bim-sync.exe --image C:\images\sdcard.img --disk 1
 
 Set-Disk -Number 1 -IsOffline $false
 ```

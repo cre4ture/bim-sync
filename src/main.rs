@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "raw-image-sync",
+    name = "bim-sync",
     about = "Incrementally sync a raw image file to a Windows physical disk"
 )]
 struct Args {
@@ -316,7 +316,7 @@ mod tests {
     #[test]
     fn cli_parses_required_args_and_defaults() {
         let args = Args::try_parse_from([
-            "raw-image-sync",
+            "bim-sync",
             "--image",
             r"C:\images\sdcard.img",
             "--disk",
@@ -334,7 +334,7 @@ mod tests {
     #[test]
     fn cli_parses_optional_flags() {
         let args = Args::try_parse_from([
-            "raw-image-sync",
+            "bim-sync",
             "--image",
             r"C:\images\sdcard.img",
             "--disk",
