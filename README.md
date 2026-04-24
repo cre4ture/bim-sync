@@ -6,6 +6,8 @@ It compares the image and target disk block by block, writes only blocks that di
 
 This is useful when repeatedly flashing mostly unchanged SD card images and you want to avoid rewriting the entire card every time.
 
+<img width="1421" height="275" alt="image" src="https://github.com/user-attachments/assets/edc35867-c769-427b-b92f-f755077aaf74" />
+
 ## Features
 
 - Writes a raw `.img` file to a Windows physical disk
