@@ -39,3 +39,67 @@ jobs:
 
       - name: Run tests
         run: cargo test --all-targets --all-features
+
+      - name: Run manual raw disk smoke test on VHD
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          cargo build --release
+
+          $vhd = Join-Path $env:RUNNER_TEMP 'bim-sync-ci.vhd'
+          $diskpartScript = Join-Path $env:RUNNER_TEMP 'bim-sync-create-vhd.diskpart'
+          $diskNumber = $null
+
+          if (Test-Path -LiteralPath $vhd) {
+            Remove-Item -LiteralPath $vhd -Force
+          }
+
+          try {
+            @(
+              "create vdisk file=`"$vhd`" maximum=64 type=expandable"
+              "select vdisk file=`"$vhd`""
+              "attach vdisk"
+            ) | Set-Content -LiteralPath $diskpartScript -Encoding ascii
+
+            diskpart /s $diskpartScript
+            if ($LASTEXITCODE -ne 0) {
+              throw "diskpart failed with exit code $LASTEXITCODE"
+            }
+
+            $disk = $null
+            for ($attempt = 1; ($attempt -le 30) -and ($null -eq $disk); $attempt++) {
+              try {
+                $disk = Get-DiskImage -ImagePath $vhd | Get-Disk -ErrorAction Stop
+              } catch {
+                Start-Sleep -Seconds 1
+              }
+            }
+
+            if ($null -eq $disk) {
+              throw "Could not resolve attached VHD to a disk"
+            }
+
+            if ($disk.IsBoot -or $disk.IsSystem) {
+              throw "Refusing to run raw disk smoke test against boot/system disk $($disk.Number)"
+            }
+
+            $diskNumber = [int]$disk.Number
+            Write-Host "Running manual smoke test against VHD-backed PhysicalDrive$diskNumber"
+
+            Set-Disk -Number $diskNumber -IsReadOnly $false
+            Set-Disk -Number $diskNumber -IsOffline $true
+
+            .\target\release\bim-sync.exe --manual-test --disk $diskNumber
+          } finally {
+            if ($null -ne $diskNumber) {
+              Set-Disk -Number $diskNumber -IsOffline $false -ErrorAction SilentlyContinue
+            }
+
+            Dismount-DiskImage -ImagePath $vhd -ErrorAction SilentlyContinue
+
+            if (Test-Path -LiteralPath $vhd) {
+              Remove-Item -LiteralPath $vhd -Force -ErrorAction SilentlyContinue
+            }
+          }
