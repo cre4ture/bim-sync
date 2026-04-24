@@ -14,6 +14,7 @@ This is useful when repeatedly flashing mostly unchanged SD card images and you 
 - Supports dry-run comparison mode
 - Verifies written blocks by default
 - Configurable block size
+- Shows a progress bar with throughput and ETA
 - Includes a destructive manual SD-card test mode
 - Intended for SD cards and removable media
 
@@ -130,6 +131,9 @@ To compare the image with the SD card without writing anything:
 
 This reports differing blocks, exact byte differences, and how many bytes are
 inside the differing blocks. It does not modify the target disk.
+
+During compare or sync, `bim-sync` shows a progress bar with checked bytes,
+throughput, ETA, byte differences, and bytes in differing blocks.
 
 ## Sync Image To SD Card
 

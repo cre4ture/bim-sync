@@ -1,8 +1,10 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -208,7 +210,9 @@ fn run_sync_mode(args: &Args, disk_path: &str, block_size: u64) -> Result<()> {
             })?
     };
 
-    let summary = sync_image_to_disk(
+    let progress = SyncProgressReporter::new(image_size)?;
+
+    let sync_result = sync_image_to_disk(
         &mut image,
         &mut disk,
         image_size,
@@ -217,38 +221,23 @@ fn run_sync_mode(args: &Args, disk_path: &str, block_size: u64) -> Result<()> {
             verify_only: args.verify_only,
             verify_writes: !args.no_verify_writes,
         },
-        |event| match event {
-            SyncEvent::Diff { offset, length } => {
-                println!("DIFF block_offset={} block_length={}", offset, length);
-            }
-            SyncEvent::Wrote {
-                offset,
-                length,
-                verified,
-            } => {
-                if verified {
-                    println!("WROTE+VERIFIED offset={} length={}", offset, length);
-                } else {
-                    println!("WROTE offset={} length={}", offset, length);
-                }
-            }
-            SyncEvent::Progress {
-                checked_bytes,
-                differing_bytes,
-                rewrite_bytes,
-                image_size,
-            } => {
-                let pct = checked_bytes as f64 * 100.0 / image_size as f64;
-                println!(
-                    "Progress: {:.2}% checked, {:.1} MiB byte differences, {:.1} MiB in differing blocks",
-                    pct,
-                    differing_bytes as f64 / 1024.0 / 1024.0,
-                    rewrite_bytes as f64 / 1024.0 / 1024.0
-                );
-            }
-        },
-    )?;
+        |event| progress.handle_event(event),
+    );
 
+    match sync_result {
+        Ok(summary) => {
+            progress.finish(summary);
+            print_sync_summary(summary);
+            Ok(())
+        }
+        Err(err) => {
+            progress.abandon();
+            Err(err)
+        }
+    }
+}
+
+fn print_sync_summary(summary: SyncSummary) {
     println!();
     println!("Done.");
     println!("Blocks different: {}", summary.different_blocks);
@@ -267,8 +256,79 @@ fn run_sync_mode(args: &Args, disk_path: &str, block_size: u64) -> Result<()> {
         summary.skipped_bytes(),
         summary.skipped_bytes() as f64 / 1024.0 / 1024.0
     );
+}
 
-    Ok(())
+struct SyncProgressReporter {
+    bar: ProgressBar,
+}
+
+impl SyncProgressReporter {
+    fn new(image_size: u64) -> Result<Self> {
+        let bar = ProgressBar::new(image_size);
+        bar.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({percent_precise}%) {bytes_per_sec} ETA {eta_precise} {msg}",
+            )
+            .context("Could not create progress bar style")?
+            .progress_chars("=>-"),
+        );
+        bar.set_message("starting");
+        bar.enable_steady_tick(Duration::from_millis(100));
+
+        Ok(Self { bar })
+    }
+
+    fn handle_event(&self, event: SyncEvent) {
+        match event {
+            SyncEvent::Diff { offset, length } => {
+                self.bar.set_message(format!(
+                    "diff block at {} ({})",
+                    offset,
+                    HumanBytes(length as u64)
+                ));
+            }
+            SyncEvent::Wrote {
+                offset,
+                length,
+                verified,
+            } => {
+                let action = if verified { "wrote+verified" } else { "wrote" };
+                self.bar.set_message(format!(
+                    "{} {} at {}",
+                    action,
+                    HumanBytes(length as u64),
+                    offset
+                ));
+            }
+            SyncEvent::Progress {
+                checked_bytes,
+                differing_bytes,
+                rewrite_bytes,
+                image_size,
+            } => {
+                self.bar.set_length(image_size);
+                self.bar.set_position(checked_bytes);
+                self.bar.set_message(format!(
+                    "diff {} | rewrite {}",
+                    HumanBytes(differing_bytes),
+                    HumanBytes(rewrite_bytes)
+                ));
+            }
+        }
+    }
+
+    fn finish(&self, summary: SyncSummary) {
+        self.bar.finish_with_message(format!(
+            "done: diff {} | rewrite {} | skipped {}",
+            HumanBytes(summary.differing_bytes),
+            HumanBytes(summary.rewrite_bytes),
+            HumanBytes(summary.skipped_bytes())
+        ));
+    }
+
+    fn abandon(&self) {
+        self.bar.abandon_with_message("sync failed");
+    }
 }
 
 fn run_manual_test_mode(disk_number: u32, disk_path: &str, block_size: u64) -> Result<()> {
@@ -726,14 +786,12 @@ where
         offset += img_read as u64;
         summary.checked_bytes += img_read as u64;
 
-        if summary.checked_bytes % (512 * 1024 * 1024) < options.block_size {
-            report(SyncEvent::Progress {
-                checked_bytes: summary.checked_bytes,
-                differing_bytes: summary.differing_bytes,
-                rewrite_bytes: summary.rewrite_bytes,
-                image_size,
-            });
-        }
+        report(SyncEvent::Progress {
+            checked_bytes: summary.checked_bytes,
+            differing_bytes: summary.differing_bytes,
+            rewrite_bytes: summary.rewrite_bytes,
+            image_size,
+        });
     }
 
     Ok(summary)
@@ -1020,6 +1078,38 @@ mod tests {
     }
 
     #[test]
+    fn progress_events_are_reported_for_each_checked_block() {
+        let image_bytes = vec![1, 2, 3, 4, 5];
+        let mut image = Cursor::new(image_bytes.clone());
+        let mut disk = Cursor::new(image_bytes);
+        let mut events = Vec::new();
+
+        let summary = sync_image_to_disk(
+            &mut image,
+            &mut disk,
+            5,
+            SyncOptions {
+                block_size: 2,
+                verify_only: true,
+                verify_writes: true,
+            },
+            |event| events.push(event),
+        )
+        .unwrap();
+
+        let positions: Vec<u64> = events
+            .iter()
+            .filter_map(|event| match event {
+                SyncEvent::Progress { checked_bytes, .. } => Some(*checked_bytes),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(summary.checked_bytes, 5);
+        assert_eq!(positions, vec![2, 4, 5]);
+    }
+
+    #[test]
     fn sync_writes_only_changed_blocks_and_verifies() {
         let image_bytes = vec![1, 2, 3, 4, 5, 6];
         let mut image = Cursor::new(image_bytes.clone());
@@ -1297,7 +1387,9 @@ mod tests {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             let offset = self.inner.position();
 
-            if offset % self.alignment != 0 || buf.len() as u64 % self.alignment != 0 {
+            if !offset.is_multiple_of(self.alignment)
+                || !(buf.len() as u64).is_multiple_of(self.alignment)
+            {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
                     format!("unaligned write offset={offset} length={}", buf.len()),
