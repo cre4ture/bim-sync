@@ -142,6 +142,9 @@ To write only changed blocks and verify each written block:
 
 Manual test mode writes a generated 64 KiB test image to the beginning of the target disk, verifies it, modifies 32 bytes on the disk, verifies that the difference is detected, repairs the disk by syncing the generated image again, and verifies the repaired result.
 
+The 32-byte mutation is written through the full 64 KiB test range so the raw
+disk write stays aligned for Windows removable media.
+
 This mode is destructive. It overwrites the first 64 KiB of the selected disk.
 
 Use it only with a disposable SD card:

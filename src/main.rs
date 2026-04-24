@@ -383,7 +383,8 @@ where
     ensure_no_differences(ManualTestPhase::VerifyInitialWrite, initial_verify)?;
 
     report(ManualTestEvent::PhaseStarted(ManualTestPhase::ModifyDisk));
-    write_exact_at(disk, mutation_offset, &mutation).context("Could not modify target disk")?;
+    write_manual_test_mutation(disk, &image, mutation_offset, &mutation)
+        .context("Could not modify target disk")?;
     report(ManualTestEvent::Modified {
         offset: mutation_offset,
         length: mutation.len(),
@@ -518,6 +519,31 @@ fn manual_test_mutation(image: &[u8], offset: u64, length: usize) -> Result<Vec<
     }
 
     Ok(image[start..end].iter().map(|byte| byte ^ 0xA5).collect())
+}
+
+fn write_manual_test_mutation<W>(
+    writer: &mut W,
+    image: &[u8],
+    offset: u64,
+    mutation: &[u8],
+) -> Result<()>
+where
+    W: Write + Seek,
+{
+    let start = usize::try_from(offset).context("Manual test mutation offset is too large")?;
+    let end = start
+        .checked_add(mutation.len())
+        .context("Manual test mutation range is too large")?;
+
+    if end > image.len() {
+        bail!("Manual test mutation range exceeds the test image");
+    }
+
+    let mut mutated_image = image.to_vec();
+    mutated_image[start..end].copy_from_slice(mutation);
+
+    write_exact_at(writer, 0, &mutated_image)
+        .context("Could not write mutated manual-test image range")
 }
 
 fn write_exact_at<W>(writer: &mut W, offset: u64, bytes: &[u8]) -> Result<()>
@@ -780,6 +806,31 @@ mod tests {
         assert!(summary.modified_verify.different_blocks > 0);
         assert!(summary.repair.different_blocks > 0);
         assert_eq!(summary.repaired_verify.different_blocks, 0);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ManualTestEvent::Modified { .. })));
+    }
+
+    #[test]
+    fn manual_test_mutation_uses_raw_disk_aligned_write() {
+        let image_size = 128;
+        let expected_image = manual_test_image(image_size).unwrap();
+        let mut disk = AlignedWriteDisk::new(vec![0; image_size], 64);
+        let mut events = Vec::new();
+
+        let summary = run_manual_sd_test(
+            &mut disk,
+            ManualTestOptions {
+                test_image_size: image_size,
+                block_size: 64,
+            },
+            |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(disk.into_inner(), expected_image);
+        assert_eq!(summary.mutation_offset, 48);
+        assert_eq!(summary.mutation_length, MANUAL_TEST_MUTATION_LEN);
         assert!(events
             .iter()
             .any(|event| matches!(event, ManualTestEvent::Modified { .. })));
@@ -1118,6 +1169,55 @@ mod tests {
     }
 
     impl Seek for CorruptingDisk {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    struct AlignedWriteDisk {
+        inner: Cursor<Vec<u8>>,
+        alignment: u64,
+    }
+
+    impl AlignedWriteDisk {
+        fn new(bytes: Vec<u8>, alignment: u64) -> Self {
+            Self {
+                inner: Cursor::new(bytes),
+                alignment,
+            }
+        }
+
+        fn into_inner(self) -> Vec<u8> {
+            self.inner.into_inner()
+        }
+    }
+
+    impl Read for AlignedWriteDisk {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    impl Write for AlignedWriteDisk {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let offset = self.inner.position();
+
+            if offset % self.alignment != 0 || buf.len() as u64 % self.alignment != 0 {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("unaligned write offset={offset} length={}", buf.len()),
+                ));
+            }
+
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Seek for AlignedWriteDisk {
         fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
             self.inner.seek(pos)
         }
