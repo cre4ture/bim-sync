@@ -11,8 +11,13 @@ use std::path::PathBuf;
 )]
 struct Args {
     /// Path to the raw image file, for example C:\images\sdcard.img
-    #[arg(short, long)]
-    image: PathBuf,
+    #[arg(
+        short,
+        long,
+        required_unless_present = "manual_test",
+        conflicts_with = "manual_test"
+    )]
+    image: Option<PathBuf>,
 
     /// Windows physical disk number, for example 1 for \\.\PhysicalDrive1
     #[arg(short, long)]
@@ -29,7 +34,14 @@ struct Args {
     /// Skip read-after-write verification
     #[arg(long)]
     no_verify_writes: bool,
+
+    /// Run a destructive generated-image test against the target disk
+    #[arg(long, conflicts_with_all = ["verify_only", "no_verify_writes"])]
+    manual_test: bool,
 }
+
+const MANUAL_TEST_IMAGE_SIZE: usize = 64 * 1024;
+const MANUAL_TEST_MUTATION_LEN: usize = 32;
 
 #[derive(Debug, Clone, Copy)]
 struct SyncOptions {
@@ -38,14 +50,14 @@ struct SyncOptions {
     verify_writes: bool,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct SyncSummary {
     checked_bytes: u64,
     changed_bytes: u64,
     different_blocks: u64,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SyncEvent {
     Diff {
         offset: u64,
@@ -63,24 +75,98 @@ enum SyncEvent {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ManualTestOptions {
+    test_image_size: usize,
+    block_size: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManualTestSummary {
+    image_size: u64,
+    mutation_offset: u64,
+    mutation_length: usize,
+    initial_write: SyncSummary,
+    initial_verify: SyncSummary,
+    modified_verify: SyncSummary,
+    repair: SyncSummary,
+    repaired_verify: SyncSummary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualTestPhase {
+    InitialWrite,
+    VerifyInitialWrite,
+    ModifyDisk,
+    VerifyModifiedDisk,
+    RepairDisk,
+    VerifyRepairedDisk,
+}
+
+impl ManualTestPhase {
+    fn label(self) -> &'static str {
+        match self {
+            ManualTestPhase::InitialWrite => "initial write",
+            ManualTestPhase::VerifyInitialWrite => "verify initial write",
+            ManualTestPhase::ModifyDisk => "modify disk",
+            ManualTestPhase::VerifyModifiedDisk => "verify modified disk",
+            ManualTestPhase::RepairDisk => "repair disk",
+            ManualTestPhase::VerifyRepairedDisk => "verify repaired disk",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualTestEvent {
+    PhaseStarted(ManualTestPhase),
+    Sync {
+        phase: ManualTestPhase,
+        event: SyncEvent,
+    },
+    PhaseSummary {
+        phase: ManualTestPhase,
+        summary: SyncSummary,
+    },
+    Modified {
+        offset: u64,
+        length: usize,
+    },
+    PhaseCompleted(ManualTestPhase),
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    if args.block_size_mib == 0 {
+    let disk_path = format!(r"\\.\PhysicalDrive{}", args.disk);
+    let block_size = block_size_bytes(args.block_size_mib)?;
+
+    if args.manual_test {
+        run_manual_test_mode(args.disk, &disk_path, block_size)
+    } else {
+        run_sync_mode(&args, &disk_path, block_size)
+    }
+}
+
+fn block_size_bytes(block_size_mib: u64) -> Result<u64> {
+    if block_size_mib == 0 {
         bail!("Block size must be greater than zero");
     }
 
-    let image_size = std::fs::metadata(&args.image)
-        .with_context(|| format!("Could not stat image file {:?}", args.image))?
+    block_size_mib
+        .checked_mul(1024 * 1024)
+        .context("Block size is too large")
+}
+
+fn run_sync_mode(args: &Args, disk_path: &str, block_size: u64) -> Result<()> {
+    let image_path = args
+        .image
+        .as_ref()
+        .context("--image is required unless --manual-test is used")?;
+    let image_size = std::fs::metadata(image_path)
+        .with_context(|| format!("Could not stat image file {:?}", image_path))?
         .len();
 
-    let disk_path = format!(r"\\.\PhysicalDrive{}", args.disk);
-    let block_size = args
-        .block_size_mib
-        .checked_mul(1024 * 1024)
-        .context("Block size is too large")?;
-
-    println!("Image:       {:?}", args.image);
+    println!("Image:       {:?}", image_path);
     println!("Target disk: {}", disk_path);
     println!("Image size:  {} bytes", image_size);
     println!("Block size:  {} bytes", block_size);
@@ -94,19 +180,19 @@ fn main() -> Result<()> {
     println!("This program can overwrite disks.");
     println!();
 
-    let mut image = File::open(&args.image)
-        .with_context(|| format!("Could not open image file {:?}", args.image))?;
+    let mut image = File::open(image_path)
+        .with_context(|| format!("Could not open image file {:?}", image_path))?;
 
     let mut disk = if args.verify_only {
         OpenOptions::new()
             .read(true)
-            .open(&disk_path)
+            .open(disk_path)
             .with_context(|| format!("Could not open {} for reading", disk_path))?
     } else {
         OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&disk_path)
+            .open(disk_path)
             .with_context(|| {
                 format!(
                     "Could not open {disk_path} for read/write. Run as Administrator and make sure the disk is offline."
@@ -161,6 +247,292 @@ fn main() -> Result<()> {
         summary.changed_bytes,
         summary.changed_bytes as f64 / 1024.0 / 1024.0
     );
+
+    Ok(())
+}
+
+fn run_manual_test_mode(disk_number: u32, disk_path: &str, block_size: u64) -> Result<()> {
+    println!("Manual SD-card test mode");
+    println!("Target disk: {}", disk_path);
+    println!("Test image size: {} bytes", MANUAL_TEST_IMAGE_SIZE);
+    println!("Block size: {} bytes", block_size);
+    println!();
+    println!(
+        "WARNING: This overwrites the first {} bytes of PhysicalDrive{}.",
+        MANUAL_TEST_IMAGE_SIZE, disk_number
+    );
+    println!("Use only a disposable SD card selected on purpose.");
+    println!();
+
+    let mut disk = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(disk_path)
+        .with_context(|| {
+            format!(
+                "Could not open {disk_path} for read/write. Run as Administrator and make sure the disk is offline."
+            )
+        })?;
+
+    let summary = run_manual_sd_test(
+        &mut disk,
+        ManualTestOptions {
+            test_image_size: MANUAL_TEST_IMAGE_SIZE,
+            block_size,
+        },
+        print_manual_test_event,
+    )?;
+
+    println!();
+    println!("Manual test complete.");
+    println!(
+        "Modified {} bytes at offset {}, then repaired the target.",
+        summary.mutation_length, summary.mutation_offset
+    );
+
+    Ok(())
+}
+
+fn print_manual_test_event(event: ManualTestEvent) {
+    match event {
+        ManualTestEvent::PhaseStarted(phase) => {
+            println!("== {} ==", phase.label());
+        }
+        ManualTestEvent::Sync { phase, event } => match event {
+            SyncEvent::Diff { offset, length } => {
+                println!(
+                    "{}: DIFF offset={} length={}",
+                    phase.label(),
+                    offset,
+                    length
+                );
+            }
+            SyncEvent::Wrote {
+                offset,
+                length,
+                verified,
+            } => {
+                if verified {
+                    println!(
+                        "{}: WROTE+VERIFIED offset={} length={}",
+                        phase.label(),
+                        offset,
+                        length
+                    );
+                } else {
+                    println!(
+                        "{}: WROTE offset={} length={}",
+                        phase.label(),
+                        offset,
+                        length
+                    );
+                }
+            }
+            SyncEvent::Progress { .. } => {}
+        },
+        ManualTestEvent::PhaseSummary { phase, summary } => {
+            println!(
+                "{} summary: {} differing blocks, {} differing bytes",
+                phase.label(),
+                summary.different_blocks,
+                summary.changed_bytes
+            );
+        }
+        ManualTestEvent::Modified { offset, length } => {
+            println!(
+                "modified target bytes at offset={} length={}",
+                offset, length
+            );
+        }
+        ManualTestEvent::PhaseCompleted(phase) => {
+            println!("{} complete", phase.label());
+        }
+    }
+}
+
+fn run_manual_sd_test<D, F>(
+    disk: &mut D,
+    options: ManualTestOptions,
+    mut report: F,
+) -> Result<ManualTestSummary>
+where
+    D: Read + Write + Seek,
+    F: FnMut(ManualTestEvent),
+{
+    let image = manual_test_image(options.test_image_size)?;
+    let mutation_offset = manual_test_mutation_offset(image.len())?;
+    let mutation = manual_test_mutation(&image, mutation_offset, MANUAL_TEST_MUTATION_LEN)?;
+
+    let initial_write = run_manual_sync_phase(
+        disk,
+        &image,
+        options.block_size,
+        false,
+        ManualTestPhase::InitialWrite,
+        &mut report,
+    )?;
+
+    let initial_verify = run_manual_sync_phase(
+        disk,
+        &image,
+        options.block_size,
+        true,
+        ManualTestPhase::VerifyInitialWrite,
+        &mut report,
+    )?;
+    ensure_no_differences(ManualTestPhase::VerifyInitialWrite, initial_verify)?;
+
+    report(ManualTestEvent::PhaseStarted(ManualTestPhase::ModifyDisk));
+    write_exact_at(disk, mutation_offset, &mutation).context("Could not modify target disk")?;
+    report(ManualTestEvent::Modified {
+        offset: mutation_offset,
+        length: mutation.len(),
+    });
+    report(ManualTestEvent::PhaseCompleted(ManualTestPhase::ModifyDisk));
+
+    let modified_verify = run_manual_sync_phase(
+        disk,
+        &image,
+        options.block_size,
+        true,
+        ManualTestPhase::VerifyModifiedDisk,
+        &mut report,
+    )?;
+    if modified_verify.different_blocks == 0 {
+        bail!("Manual test modification was not detected");
+    }
+
+    let repair = run_manual_sync_phase(
+        disk,
+        &image,
+        options.block_size,
+        false,
+        ManualTestPhase::RepairDisk,
+        &mut report,
+    )?;
+
+    let repaired_verify = run_manual_sync_phase(
+        disk,
+        &image,
+        options.block_size,
+        true,
+        ManualTestPhase::VerifyRepairedDisk,
+        &mut report,
+    )?;
+    ensure_no_differences(ManualTestPhase::VerifyRepairedDisk, repaired_verify)?;
+
+    Ok(ManualTestSummary {
+        image_size: image.len() as u64,
+        mutation_offset,
+        mutation_length: mutation.len(),
+        initial_write,
+        initial_verify,
+        modified_verify,
+        repair,
+        repaired_verify,
+    })
+}
+
+fn run_manual_sync_phase<D, F>(
+    disk: &mut D,
+    image: &[u8],
+    block_size: u64,
+    verify_only: bool,
+    phase: ManualTestPhase,
+    report: &mut F,
+) -> Result<SyncSummary>
+where
+    D: Read + Write + Seek,
+    F: FnMut(ManualTestEvent),
+{
+    report(ManualTestEvent::PhaseStarted(phase));
+
+    let mut image_reader = std::io::Cursor::new(image.to_vec());
+    let summary = sync_image_to_disk(
+        &mut image_reader,
+        disk,
+        image.len() as u64,
+        SyncOptions {
+            block_size,
+            verify_only,
+            verify_writes: true,
+        },
+        |event| report(ManualTestEvent::Sync { phase, event }),
+    )?;
+
+    report(ManualTestEvent::PhaseSummary { phase, summary });
+
+    Ok(summary)
+}
+
+fn ensure_no_differences(phase: ManualTestPhase, summary: SyncSummary) -> Result<()> {
+    if summary.different_blocks != 0 {
+        bail!(
+            "Manual test phase '{}' found {} differing blocks",
+            phase.label(),
+            summary.different_blocks
+        );
+    }
+
+    Ok(())
+}
+
+fn manual_test_image(size: usize) -> Result<Vec<u8>> {
+    if size < MANUAL_TEST_MUTATION_LEN {
+        bail!(
+            "Manual test image must be at least {} bytes",
+            MANUAL_TEST_MUTATION_LEN
+        );
+    }
+
+    Ok((0..size)
+        .map(|index| {
+            let value = index as u32;
+            (value
+                .wrapping_mul(37)
+                .wrapping_add(value.rotate_left(5))
+                .wrapping_add(0xA5)) as u8
+        })
+        .collect())
+}
+
+fn manual_test_mutation_offset(image_size: usize) -> Result<u64> {
+    if image_size < MANUAL_TEST_MUTATION_LEN {
+        bail!(
+            "Manual test image must be at least {} bytes",
+            MANUAL_TEST_MUTATION_LEN
+        );
+    }
+
+    Ok(((image_size - MANUAL_TEST_MUTATION_LEN) / 2) as u64)
+}
+
+fn manual_test_mutation(image: &[u8], offset: u64, length: usize) -> Result<Vec<u8>> {
+    let start = usize::try_from(offset).context("Manual test mutation offset is too large")?;
+    let end = start
+        .checked_add(length)
+        .context("Manual test mutation range is too large")?;
+
+    if end > image.len() {
+        bail!("Manual test mutation range exceeds the test image");
+    }
+
+    Ok(image[start..end].iter().map(|byte| byte ^ 0xA5).collect())
+}
+
+fn write_exact_at<W>(writer: &mut W, offset: u64, bytes: &[u8]) -> Result<()>
+where
+    W: Write + Seek,
+{
+    writer
+        .seek(SeekFrom::Start(offset))
+        .with_context(|| format!("Could not seek target disk to offset {}", offset))?;
+    writer
+        .write_all(bytes)
+        .with_context(|| format!("Could not write target disk at offset {}", offset))?;
+    writer
+        .flush()
+        .with_context(|| format!("Could not flush target disk at offset {}", offset))?;
 
     Ok(())
 }
@@ -324,11 +696,12 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(args.image, PathBuf::from(r"C:\images\sdcard.img"));
+        assert_eq!(args.image, Some(PathBuf::from(r"C:\images\sdcard.img")));
         assert_eq!(args.disk, 7);
         assert_eq!(args.block_size_mib, 4);
         assert!(!args.verify_only);
         assert!(!args.no_verify_writes);
+        assert!(!args.manual_test);
     }
 
     #[test]
@@ -349,6 +722,113 @@ mod tests {
         assert_eq!(args.block_size_mib, 16);
         assert!(args.verify_only);
         assert!(args.no_verify_writes);
+        assert!(!args.manual_test);
+    }
+
+    #[test]
+    fn cli_parses_manual_test_without_image() {
+        let args = Args::try_parse_from(["bim-sync", "--disk", "1", "--manual-test"]).unwrap();
+
+        assert_eq!(args.image, None);
+        assert_eq!(args.disk, 1);
+        assert!(args.manual_test);
+    }
+
+    #[test]
+    fn cli_requires_image_for_normal_sync() {
+        let err = Args::try_parse_from(["bim-sync", "--disk", "1"]).unwrap_err();
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn cli_rejects_manual_test_with_normal_sync_args() {
+        let err = Args::try_parse_from([
+            "bim-sync",
+            "--disk",
+            "1",
+            "--manual-test",
+            "--image",
+            r"C:\images\sdcard.img",
+        ])
+        .unwrap_err();
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn manual_test_workflow_writes_detects_and_repairs_target() {
+        let image_size = 128;
+        let expected_image = manual_test_image(image_size).unwrap();
+        let mut disk = Cursor::new(vec![0; image_size]);
+        let mut events = Vec::new();
+
+        let summary = run_manual_sd_test(
+            &mut disk,
+            ManualTestOptions {
+                test_image_size: image_size,
+                block_size: 16,
+            },
+            |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(disk.into_inner(), expected_image);
+        assert_eq!(summary.image_size, image_size as u64);
+        assert_eq!(summary.mutation_length, MANUAL_TEST_MUTATION_LEN);
+        assert_eq!(summary.initial_verify.different_blocks, 0);
+        assert!(summary.modified_verify.different_blocks > 0);
+        assert!(summary.repair.different_blocks > 0);
+        assert_eq!(summary.repaired_verify.different_blocks, 0);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ManualTestEvent::Modified { .. })));
+    }
+
+    #[test]
+    fn manual_test_rejects_too_small_test_image() {
+        let mut disk = Cursor::new(vec![0; MANUAL_TEST_MUTATION_LEN - 1]);
+        let mut events = Vec::new();
+
+        let err = run_manual_sd_test(
+            &mut disk,
+            ManualTestOptions {
+                test_image_size: MANUAL_TEST_MUTATION_LEN - 1,
+                block_size: 4,
+            },
+            |event| events.push(event),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("Manual test image must be"));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn manual_test_reports_short_target_read() {
+        let image_size = 128;
+        let mut disk = Cursor::new(vec![0; image_size - 1]);
+        let mut events = Vec::new();
+
+        let err = run_manual_sd_test(
+            &mut disk,
+            ManualTestOptions {
+                test_image_size: image_size,
+                block_size: 16,
+            },
+            |event| events.push(event),
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("Could not read target disk at offset"));
+        assert_eq!(
+            events.first(),
+            Some(&ManualTestEvent::PhaseStarted(
+                ManualTestPhase::InitialWrite
+            ))
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ This is useful when repeatedly flashing mostly unchanged SD card images and you 
 - Supports dry-run comparison mode
 - Verifies written blocks by default
 - Configurable block size
+- Includes a destructive manual SD-card test mode
 - Intended for SD cards and removable media
 
 ## Warning
@@ -114,6 +115,20 @@ To write only changed blocks and verify each written block:
 ```powershell
 .\target\release\bim-sync.exe --image C:\path\sdcard.img --disk 1
 ```
+
+## Manual SD-Card Test Mode
+
+Manual test mode writes a generated 64 KiB test image to the beginning of the target disk, verifies it, modifies 32 bytes on the disk, verifies that the difference is detected, repairs the disk by syncing the generated image again, and verifies the repaired result.
+
+This mode is destructive. It overwrites the first 64 KiB of the selected disk.
+
+Use it only with a disposable SD card:
+
+```powershell
+.\target\release\bim-sync.exe --disk 1 --manual-test
+```
+
+Manual test mode does not use `--image`. The `--block-size-mib` option still controls the sync block size used during the test.
 
 ## Skip Write Verification
 
