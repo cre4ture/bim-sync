@@ -195,7 +195,7 @@ fn run_sync_mode(args: &Args, disk_path: &str, block_size: u64) -> Result<()> {
             .open(disk_path)
             .with_context(|| {
                 format!(
-                    "Could not open {disk_path} for read/write. Run as Administrator and make sure the disk is offline."
+                    "Could not open {disk_path} for read/write. Run as Administrator and make sure the disk is offline, or for removable media, that its volumes are dismounted."
                 )
             })?
     };
@@ -270,7 +270,7 @@ fn run_manual_test_mode(disk_number: u32, disk_path: &str, block_size: u64) -> R
         .open(disk_path)
         .with_context(|| {
             format!(
-                "Could not open {disk_path} for read/write. Run as Administrator and make sure the disk is offline."
+                "Could not open {disk_path} for read/write. Run as Administrator and make sure the disk is offline, or for removable media, that its volumes are dismounted."
             )
         })?;
 

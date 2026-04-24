@@ -30,7 +30,7 @@ Always verify the target disk before writing.
 - Windows
 - Rust toolchain
 - Administrator PowerShell or Administrator terminal
-- Target disk should be offline before writing
+- Target disk should be offline, or its volumes should be dismounted, before writing
 
 ## Project Layout
 
@@ -87,9 +87,9 @@ So the disk number passed to the tool would be:
 
 Do not use a disk where `IsBoot` or `IsSystem` is `True`.
 
-## Take The Target Disk Offline
+## Prepare The Target Disk
 
-Before writing, take the SD card offline:
+Before writing to a fixed disk, take the target disk offline:
 
 ```powershell
 Set-Disk -Number 1 -IsOffline $true
@@ -97,6 +97,28 @@ Set-Disk -Number 1 -IsReadOnly $false
 ```
 
 Replace `1` with the correct disk number.
+
+Some removable media, including many SD cards and USB card readers, cannot be
+taken offline with `Set-Disk`. Windows reports:
+
+```text
+Removable media cannot be set to offline.
+```
+
+For removable media, close File Explorer windows and any programs using the
+card, then dismount each mounted volume instead:
+
+```powershell
+$diskNumber = 1
+Get-Partition -DiskNumber $diskNumber |
+    Where-Object DriveLetter |
+    ForEach-Object { mountvol "$($_.DriveLetter):" /P }
+
+Set-Disk -Number $diskNumber -IsReadOnly $false
+```
+
+This removes the current drive-letter mount points for the card. Reinsert the
+card after writing if Windows does not automatically assign drive letters again.
 
 ## Dry-Run Compare
 
@@ -158,13 +180,14 @@ Smaller blocks may reduce unnecessary writes but increase overhead.
 
 ## Bring The Disk Back Online
 
-After writing:
+After writing to a fixed disk:
 
 ```powershell
 Set-Disk -Number 1 -IsOffline $false
 ```
 
-Windows may then detect the partitions again.
+For removable media that was dismounted with `mountvol /P`, unplug and reinsert
+the card or assign drive letters again in Disk Management.
 
 ## Example Workflow
 
@@ -174,13 +197,17 @@ cargo build --release
 Get-CimInstance Win32_DiskDrive | Select-Object DeviceID,Model,Size
 Get-Disk | Select-Object Number,FriendlyName,Size,BusType,IsBoot,IsSystem
 
-Set-Disk -Number 1 -IsOffline $true
-Set-Disk -Number 1 -IsReadOnly $false
+$diskNumber = 1
+Get-Partition -DiskNumber $diskNumber |
+    Where-Object DriveLetter |
+    ForEach-Object { mountvol "$($_.DriveLetter):" /P }
+
+Set-Disk -Number $diskNumber -IsReadOnly $false
 
 .\target\release\bim-sync.exe --image C:\images\sdcard.img --disk 1 --verify-only
 .\target\release\bim-sync.exe --image C:\images\sdcard.img --disk 1
 
-Set-Disk -Number 1 -IsOffline $false
+# Reinsert removable media after writing if Windows does not mount it again.
 ```
 
 ## How It Works
@@ -239,7 +266,7 @@ Before writing, confirm:
 - The disk is not your boot/system disk.
 - Important data on the SD card has been backed up.
 - PowerShell or your terminal is running as Administrator.
-- The target disk has been taken offline.
+- The target disk has been taken offline, or its volumes have been dismounted.
 
 ## License
 
