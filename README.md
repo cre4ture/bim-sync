@@ -292,4 +292,4 @@ Before writing, confirm:
 
 ## License
 
-Choose a license before publishing the project, for example MIT or Apache-2.0.
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
