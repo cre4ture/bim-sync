@@ -40,7 +40,7 @@ struct Args {
     manual_test: bool,
 }
 
-const MANUAL_TEST_IMAGE_SIZE: usize = 64 * 1024;
+const MANUAL_TEST_BLOCK_COUNT: u64 = 2;
 const MANUAL_TEST_MUTATION_LEN: usize = 32;
 
 #[derive(Debug, Clone, Copy)]
@@ -53,8 +53,15 @@ struct SyncOptions {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct SyncSummary {
     checked_bytes: u64,
-    changed_bytes: u64,
+    differing_bytes: u64,
+    rewrite_bytes: u64,
     different_blocks: u64,
+}
+
+impl SyncSummary {
+    fn skipped_bytes(self) -> u64 {
+        self.checked_bytes.saturating_sub(self.rewrite_bytes)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,7 +77,8 @@ enum SyncEvent {
     },
     Progress {
         checked_bytes: u64,
-        changed_bytes: u64,
+        differing_bytes: u64,
+        rewrite_bytes: u64,
         image_size: u64,
     },
 }
@@ -211,7 +219,7 @@ fn run_sync_mode(args: &Args, disk_path: &str, block_size: u64) -> Result<()> {
         },
         |event| match event {
             SyncEvent::Diff { offset, length } => {
-                println!("DIFF offset={} length={}", offset, length);
+                println!("DIFF block_offset={} block_length={}", offset, length);
             }
             SyncEvent::Wrote {
                 offset,
@@ -226,14 +234,16 @@ fn run_sync_mode(args: &Args, disk_path: &str, block_size: u64) -> Result<()> {
             }
             SyncEvent::Progress {
                 checked_bytes,
-                changed_bytes,
+                differing_bytes,
+                rewrite_bytes,
                 image_size,
             } => {
                 let pct = checked_bytes as f64 * 100.0 / image_size as f64;
                 println!(
-                    "Progress: {:.2}% checked, {:.1} MiB different",
+                    "Progress: {:.2}% checked, {:.1} MiB byte differences, {:.1} MiB in differing blocks",
                     pct,
-                    changed_bytes as f64 / 1024.0 / 1024.0
+                    differing_bytes as f64 / 1024.0 / 1024.0,
+                    rewrite_bytes as f64 / 1024.0 / 1024.0
                 );
             }
         },
@@ -243,23 +253,38 @@ fn run_sync_mode(args: &Args, disk_path: &str, block_size: u64) -> Result<()> {
     println!("Done.");
     println!("Blocks different: {}", summary.different_blocks);
     println!(
-        "Bytes different:  {} bytes / {:.1} MiB",
-        summary.changed_bytes,
-        summary.changed_bytes as f64 / 1024.0 / 1024.0
+        "Byte differences: {} bytes / {:.1} MiB",
+        summary.differing_bytes,
+        summary.differing_bytes as f64 / 1024.0 / 1024.0
+    );
+    println!(
+        "Bytes in differing blocks: {} bytes / {:.1} MiB",
+        summary.rewrite_bytes,
+        summary.rewrite_bytes as f64 / 1024.0 / 1024.0
+    );
+    println!(
+        "Bytes skipped: {} bytes / {:.1} MiB",
+        summary.skipped_bytes(),
+        summary.skipped_bytes() as f64 / 1024.0 / 1024.0
     );
 
     Ok(())
 }
 
 fn run_manual_test_mode(disk_number: u32, disk_path: &str, block_size: u64) -> Result<()> {
+    let test_image_size = manual_test_image_size(block_size)?;
+
     println!("Manual SD-card test mode");
     println!("Target disk: {}", disk_path);
-    println!("Test image size: {} bytes", MANUAL_TEST_IMAGE_SIZE);
+    println!(
+        "Test image size: {} bytes ({} sync blocks)",
+        test_image_size, MANUAL_TEST_BLOCK_COUNT
+    );
     println!("Block size: {} bytes", block_size);
     println!();
     println!(
         "WARNING: This overwrites the first {} bytes of PhysicalDrive{}.",
-        MANUAL_TEST_IMAGE_SIZE, disk_number
+        test_image_size, disk_number
     );
     println!("Use only a disposable SD card selected on purpose.");
     println!();
@@ -277,7 +302,7 @@ fn run_manual_test_mode(disk_number: u32, disk_path: &str, block_size: u64) -> R
     let summary = run_manual_sd_test(
         &mut disk,
         ManualTestOptions {
-            test_image_size: MANUAL_TEST_IMAGE_SIZE,
+            test_image_size,
             block_size,
         },
         print_manual_test_event,
@@ -301,7 +326,7 @@ fn print_manual_test_event(event: ManualTestEvent) {
         ManualTestEvent::Sync { phase, event } => match event {
             SyncEvent::Diff { offset, length } => {
                 println!(
-                    "{}: DIFF offset={} length={}",
+                    "{}: DIFF block_offset={} block_length={}",
                     phase.label(),
                     offset,
                     length
@@ -332,10 +357,13 @@ fn print_manual_test_event(event: ManualTestEvent) {
         },
         ManualTestEvent::PhaseSummary { phase, summary } => {
             println!(
-                "{} summary: {} differing blocks, {} differing bytes",
+                "{} summary: {} bytes checked, {} differing blocks, {} byte differences, {} bytes in differing blocks, {} bytes skipped",
                 phase.label(),
+                summary.checked_bytes,
                 summary.different_blocks,
-                summary.changed_bytes
+                summary.differing_bytes,
+                summary.rewrite_bytes,
+                summary.skipped_bytes()
             );
         }
         ManualTestEvent::Modified { offset, length } => {
@@ -360,7 +388,7 @@ where
     F: FnMut(ManualTestEvent),
 {
     let image = manual_test_image(options.test_image_size)?;
-    let mutation_offset = manual_test_mutation_offset(image.len())?;
+    let mutation_offset = manual_test_mutation_offset(image.len(), options.block_size)?;
     let mutation = manual_test_mutation(&image, mutation_offset, MANUAL_TEST_MUTATION_LEN)?;
 
     let initial_write = run_manual_sync_phase(
@@ -383,7 +411,7 @@ where
     ensure_no_differences(ManualTestPhase::VerifyInitialWrite, initial_verify)?;
 
     report(ManualTestEvent::PhaseStarted(ManualTestPhase::ModifyDisk));
-    write_manual_test_mutation(disk, &image, mutation_offset, &mutation)
+    write_manual_test_mutation(disk, &image, options.block_size, mutation_offset, &mutation)
         .context("Could not modify target disk")?;
     report(ManualTestEvent::Modified {
         offset: mutation_offset,
@@ -478,6 +506,14 @@ fn ensure_no_differences(phase: ManualTestPhase, summary: SyncSummary) -> Result
     Ok(())
 }
 
+fn manual_test_image_size(block_size: u64) -> Result<usize> {
+    let image_size = block_size
+        .checked_mul(MANUAL_TEST_BLOCK_COUNT)
+        .context("Manual test image size is too large")?;
+
+    usize::try_from(image_size).context("Manual test image size is too large for this platform")
+}
+
 fn manual_test_image(size: usize) -> Result<Vec<u8>> {
     if size < MANUAL_TEST_MUTATION_LEN {
         bail!(
@@ -497,7 +533,7 @@ fn manual_test_image(size: usize) -> Result<Vec<u8>> {
         .collect())
 }
 
-fn manual_test_mutation_offset(image_size: usize) -> Result<u64> {
+fn manual_test_mutation_offset(image_size: usize, block_size: u64) -> Result<u64> {
     if image_size < MANUAL_TEST_MUTATION_LEN {
         bail!(
             "Manual test image must be at least {} bytes",
@@ -505,7 +541,21 @@ fn manual_test_mutation_offset(image_size: usize) -> Result<u64> {
         );
     }
 
-    Ok(((image_size - MANUAL_TEST_MUTATION_LEN) / 2) as u64)
+    let block_size = usize::try_from(block_size)
+        .context("Manual test block size is too large for this platform")?;
+
+    if block_size < MANUAL_TEST_MUTATION_LEN {
+        bail!(
+            "Manual test block size must be at least {} bytes",
+            MANUAL_TEST_MUTATION_LEN
+        );
+    }
+
+    if image_size < block_size {
+        bail!("Manual test image must be at least one block");
+    }
+
+    Ok(((block_size - MANUAL_TEST_MUTATION_LEN) / 2) as u64)
 }
 
 fn manual_test_mutation(image: &[u8], offset: u64, length: usize) -> Result<Vec<u8>> {
@@ -524,12 +574,15 @@ fn manual_test_mutation(image: &[u8], offset: u64, length: usize) -> Result<Vec<
 fn write_manual_test_mutation<W>(
     writer: &mut W,
     image: &[u8],
+    block_size: u64,
     offset: u64,
     mutation: &[u8],
 ) -> Result<()>
 where
     W: Write + Seek,
 {
+    let block_size = usize::try_from(block_size)
+        .context("Manual test block size is too large for this platform")?;
     let start = usize::try_from(offset).context("Manual test mutation offset is too large")?;
     let end = start
         .checked_add(mutation.len())
@@ -539,11 +592,24 @@ where
         bail!("Manual test mutation range exceeds the test image");
     }
 
-    let mut mutated_image = image.to_vec();
-    mutated_image[start..end].copy_from_slice(mutation);
+    let block_start = start / block_size * block_size;
+    let block_end = block_start
+        .checked_add(block_size)
+        .context("Manual test mutation block range is too large")?;
 
-    write_exact_at(writer, 0, &mutated_image)
-        .context("Could not write mutated manual-test image range")
+    if block_end > image.len() {
+        bail!("Manual test mutation block range exceeds the test image");
+    }
+
+    if end > block_end {
+        bail!("Manual test mutation crosses a sync block boundary");
+    }
+
+    let mut mutated_block = image[block_start..block_end].to_vec();
+    mutated_block[start - block_start..end - block_start].copy_from_slice(mutation);
+
+    write_exact_at(writer, block_start as u64, &mutated_block)
+        .context("Could not write mutated manual-test block")
 }
 
 fn write_exact_at<W>(writer: &mut W, offset: u64, bytes: &[u8]) -> Result<()>
@@ -605,8 +671,11 @@ where
             .with_context(|| format!("Could not read target disk at offset {}", offset))?;
 
         if img_buf[..img_read] != disk_buf[..img_read] {
+            let block_differing_bytes =
+                count_differing_bytes(&img_buf[..img_read], &disk_buf[..img_read]) as u64;
             summary.different_blocks += 1;
-            summary.changed_bytes += img_read as u64;
+            summary.differing_bytes += block_differing_bytes;
+            summary.rewrite_bytes += img_read as u64;
 
             if options.verify_only {
                 report(SyncEvent::Diff {
@@ -660,13 +729,21 @@ where
         if summary.checked_bytes % (512 * 1024 * 1024) < options.block_size {
             report(SyncEvent::Progress {
                 checked_bytes: summary.checked_bytes,
-                changed_bytes: summary.changed_bytes,
+                differing_bytes: summary.differing_bytes,
+                rewrite_bytes: summary.rewrite_bytes,
                 image_size,
             });
         }
     }
 
     Ok(summary)
+}
+
+fn count_differing_bytes(left: &[u8], right: &[u8]) -> usize {
+    left.iter()
+        .zip(right.iter())
+        .filter(|(left, right)| *left != *right)
+        .count()
 }
 
 /// Reads until the buffer is full or EOF is reached.
@@ -784,7 +861,7 @@ mod tests {
 
     #[test]
     fn manual_test_workflow_writes_detects_and_repairs_target() {
-        let image_size = 128;
+        let image_size = manual_test_image_size(64).unwrap();
         let expected_image = manual_test_image(image_size).unwrap();
         let mut disk = Cursor::new(vec![0; image_size]);
         let mut events = Vec::new();
@@ -793,7 +870,7 @@ mod tests {
             &mut disk,
             ManualTestOptions {
                 test_image_size: image_size,
-                block_size: 16,
+                block_size: 64,
             },
             |event| events.push(event),
         )
@@ -803,8 +880,16 @@ mod tests {
         assert_eq!(summary.image_size, image_size as u64);
         assert_eq!(summary.mutation_length, MANUAL_TEST_MUTATION_LEN);
         assert_eq!(summary.initial_verify.different_blocks, 0);
+        assert_eq!(
+            summary.modified_verify.differing_bytes,
+            MANUAL_TEST_MUTATION_LEN as u64
+        );
+        assert_eq!(summary.modified_verify.rewrite_bytes, 64);
+        assert_eq!(summary.modified_verify.skipped_bytes(), 64);
         assert!(summary.modified_verify.different_blocks > 0);
         assert!(summary.repair.different_blocks > 0);
+        assert_eq!(summary.repair.rewrite_bytes, 64);
+        assert_eq!(summary.repair.skipped_bytes(), 64);
         assert_eq!(summary.repaired_verify.different_blocks, 0);
         assert!(events
             .iter()
@@ -813,7 +898,7 @@ mod tests {
 
     #[test]
     fn manual_test_mutation_uses_raw_disk_aligned_write() {
-        let image_size = 128;
+        let image_size = manual_test_image_size(64).unwrap();
         let expected_image = manual_test_image(image_size).unwrap();
         let mut disk = AlignedWriteDisk::new(vec![0; image_size], 64);
         let mut events = Vec::new();
@@ -829,8 +914,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(disk.into_inner(), expected_image);
-        assert_eq!(summary.mutation_offset, 48);
+        assert_eq!(summary.mutation_offset, 16);
         assert_eq!(summary.mutation_length, MANUAL_TEST_MUTATION_LEN);
+        assert_eq!(
+            summary.modified_verify.differing_bytes,
+            MANUAL_TEST_MUTATION_LEN as u64
+        );
+        assert_eq!(summary.modified_verify.rewrite_bytes, 64);
+        assert_eq!(summary.modified_verify.skipped_bytes(), 64);
         assert!(events
             .iter()
             .any(|event| matches!(event, ManualTestEvent::Modified { .. })));
@@ -845,7 +936,7 @@ mod tests {
             &mut disk,
             ManualTestOptions {
                 test_image_size: MANUAL_TEST_MUTATION_LEN - 1,
-                block_size: 4,
+                block_size: 64,
             },
             |event| events.push(event),
         )
@@ -857,7 +948,7 @@ mod tests {
 
     #[test]
     fn manual_test_reports_short_target_read() {
-        let image_size = 128;
+        let image_size = manual_test_image_size(64).unwrap();
         let mut disk = Cursor::new(vec![0; image_size - 1]);
         let mut events = Vec::new();
 
@@ -865,7 +956,7 @@ mod tests {
             &mut disk,
             ManualTestOptions {
                 test_image_size: image_size,
-                block_size: 16,
+                block_size: 64,
             },
             |event| events.push(event),
         )
@@ -907,7 +998,8 @@ mod tests {
             summary,
             SyncSummary {
                 checked_bytes: 5,
-                changed_bytes: 3,
+                differing_bytes: 2,
+                rewrite_bytes: 3,
                 different_blocks: 2,
             }
         );
@@ -952,7 +1044,8 @@ mod tests {
             summary,
             SyncSummary {
                 checked_bytes: 6,
-                changed_bytes: 4,
+                differing_bytes: 3,
+                rewrite_bytes: 4,
                 different_blocks: 2,
             }
         );
@@ -998,7 +1091,8 @@ mod tests {
             summary,
             SyncSummary {
                 checked_bytes: 3,
-                changed_bytes: 2,
+                differing_bytes: 2,
+                rewrite_bytes: 2,
                 different_blocks: 2,
             }
         );
@@ -1044,7 +1138,8 @@ mod tests {
             summary,
             SyncSummary {
                 checked_bytes: 7,
-                changed_bytes: 0,
+                differing_bytes: 0,
+                rewrite_bytes: 0,
                 different_blocks: 0,
             }
         );

@@ -128,7 +128,8 @@ To compare the image with the SD card without writing anything:
 .\target\release\bim-sync.exe --image C:\path\sdcard.img --disk 1 --verify-only
 ```
 
-This reports differing blocks but does not modify the target disk.
+This reports differing blocks, exact byte differences, and how many bytes are
+inside the differing blocks. It does not modify the target disk.
 
 ## Sync Image To SD Card
 
@@ -140,12 +141,22 @@ To write only changed blocks and verify each written block:
 
 ## Manual SD-Card Test Mode
 
-Manual test mode writes a generated 64 KiB test image to the beginning of the target disk, verifies it, modifies 32 bytes on the disk, verifies that the difference is detected, repairs the disk by syncing the generated image again, and verifies the repaired result.
+Manual test mode writes a generated two-block test image to the beginning of the target disk, verifies it, modifies 32 bytes in one block, verifies that the difference is detected, repairs the disk by syncing the generated image again, and verifies the repaired result.
 
-The 32-byte mutation is written through the full 64 KiB test range so the raw
-disk write stays aligned for Windows removable media.
+The generated test image uses two sync blocks. With the default 4 MiB block
+size, the test image is 8 MiB.
 
-This mode is destructive. It overwrites the first 64 KiB of the selected disk.
+The 32-byte mutation is written through its containing sync block so the raw
+disk write stays aligned for Windows removable media, while the other sync block
+remains unchanged.
+
+The summary distinguishes exact byte differences from bytes in differing
+blocks. With the default block size, the manual test should report 32 byte
+differences, 4194304 bytes in differing blocks, and 4194304 bytes skipped after
+the mutation.
+
+This mode is destructive. It overwrites the first two sync blocks of the
+selected disk.
 
 Use it only with a disposable SD card:
 
@@ -225,6 +236,10 @@ For each block:
 6. Read the block back and verify it, unless `--no-verify-writes` is used.
 
 This means the tool still reads the whole image and the corresponding target area, but it avoids unnecessary writes.
+
+Progress and summaries report both exact byte differences and bytes in
+differing blocks. Writes happen at block granularity, so a block with only a few
+different bytes still causes the whole block to be rewritten.
 
 ## Limitations
 
