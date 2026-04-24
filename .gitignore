@@ -1,0 +1,23 @@
+# Rust build output
+/target/
+
+# Cargo backup files
+**/*.rs.bk
+
+# Local environment and logs
+.env
+.env.*
+!.env.example
+*.log
+*.tmp
+
+# Large local disk images
+*.img
+*.raw
+*.iso
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
