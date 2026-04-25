@@ -1,9 +1,11 @@
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+use flate2::read::GzDecoder;
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
+use lzma_rust2::XzReader;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
@@ -29,6 +31,14 @@ struct Args {
     #[arg(short = 'b', long, default_value_t = 4)]
     block_size_mib: u64,
 
+    /// Treat --image as an archive or compressed input
+    #[arg(long, value_enum, default_value = "auto")]
+    archive: ArchiveInputMode,
+
+    /// Entry path to stream from the archive
+    #[arg(long)]
+    archive_entry: Option<String>,
+
     /// Compare only; do not write
     #[arg(long)]
     verify_only: bool,
@@ -42,6 +52,13 @@ struct Args {
     manual_test: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ArchiveInputMode {
+    Yes,
+    No,
+    Auto,
+}
+
 const MANUAL_TEST_BLOCK_COUNT: u64 = 2;
 const MANUAL_TEST_MUTATION_LEN: usize = 32;
 
@@ -50,6 +67,12 @@ struct SyncOptions {
     block_size: u64,
     verify_only: bool,
     verify_writes: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstBlockWriteOrder {
+    Immediate,
+    Last,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -81,7 +104,7 @@ enum SyncEvent {
         checked_bytes: u64,
         differing_bytes: u64,
         rewrite_bytes: u64,
-        image_size: u64,
+        image_size: Option<u64>,
     },
 }
 
@@ -172,6 +195,20 @@ fn run_sync_mode(args: &Args, disk_path: &str, block_size: u64) -> Result<()> {
         .image
         .as_ref()
         .context("--image is required unless --manual-test is used")?;
+    let archive_kind = archive_kind_for_args(args, image_path)?;
+
+    match archive_kind {
+        Some(kind) => run_archive_sync_mode(args, disk_path, block_size, image_path, kind),
+        None => run_raw_sync_mode(args, disk_path, block_size, image_path),
+    }
+}
+
+fn run_raw_sync_mode(
+    args: &Args,
+    disk_path: &str,
+    block_size: u64,
+    image_path: &Path,
+) -> Result<()> {
     let image_size = std::fs::metadata(image_path)
         .with_context(|| format!("Could not stat image file {:?}", image_path))?
         .len();
@@ -180,24 +217,43 @@ fn run_sync_mode(args: &Args, disk_path: &str, block_size: u64) -> Result<()> {
     println!("Target disk: {}", disk_path);
     println!("Image size:  {} bytes", image_size);
     println!("Block size:  {} bytes", block_size);
+    println!("Archive:     no");
     println!("Verify only: {}", args.verify_only);
     println!();
 
-    println!(
-        "WARNING: Make absolutely sure PhysicalDrive{} is your SD card.",
-        args.disk
-    );
-    println!("This program can overwrite disks.");
-    println!();
+    print_disk_warning(args.disk);
 
     let mut image = File::open(image_path)
         .with_context(|| format!("Could not open image file {:?}", image_path))?;
+    let mut disk = open_target_disk(args, disk_path)?;
 
-    let mut disk = if args.verify_only {
+    sync_reader_with_progress(
+        &mut image,
+        &mut disk,
+        Some(image_size),
+        SyncOptions {
+            block_size,
+            verify_only: args.verify_only,
+            verify_writes: !args.no_verify_writes,
+        },
+    )
+}
+
+fn print_disk_warning(disk_number: u32) {
+    println!(
+        "WARNING: Make absolutely sure PhysicalDrive{} is your SD card.",
+        disk_number
+    );
+    println!("This program can overwrite disks.");
+    println!();
+}
+
+fn open_target_disk(args: &Args, disk_path: &str) -> Result<File> {
+    if args.verify_only {
         OpenOptions::new()
             .read(true)
             .open(disk_path)
-            .with_context(|| format!("Could not open {} for reading", disk_path))?
+            .with_context(|| format!("Could not open {} for reading", disk_path))
     } else {
         OpenOptions::new()
             .read(true)
@@ -207,20 +263,28 @@ fn run_sync_mode(args: &Args, disk_path: &str, block_size: u64) -> Result<()> {
                 format!(
                     "Could not open {disk_path} for read/write. Run as Administrator and make sure the disk is offline, or for removable media, that its volumes are dismounted."
                 )
-            })?
-    };
+            })
+    }
+}
 
+fn sync_reader_with_progress<I, D>(
+    image: &mut I,
+    disk: &mut D,
+    image_size: Option<u64>,
+    options: SyncOptions,
+) -> Result<()>
+where
+    I: Read + ?Sized,
+    D: Read + Write + Seek,
+{
     let progress = SyncProgressReporter::new(image_size)?;
 
-    let sync_result = sync_image_to_disk(
-        &mut image,
-        &mut disk,
+    let sync_result = sync_image_to_disk_stream_ordered(
+        image,
+        disk,
         image_size,
-        SyncOptions {
-            block_size,
-            verify_only: args.verify_only,
-            verify_writes: !args.no_verify_writes,
-        },
+        options,
+        FirstBlockWriteOrder::Last,
         |event| progress.handle_event(event),
     );
 
@@ -235,6 +299,552 @@ fn run_sync_mode(args: &Args, disk_path: &str, block_size: u64) -> Result<()> {
             Err(err)
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveKind {
+    Zip,
+    Tar,
+    TarGz,
+    TarXz,
+    Gzip,
+    Xz,
+    SevenZ,
+}
+
+impl ArchiveKind {
+    fn label(self) -> &'static str {
+        match self {
+            ArchiveKind::Zip => "zip",
+            ArchiveKind::Tar => "tar",
+            ArchiveKind::TarGz => "tar.gz",
+            ArchiveKind::TarXz => "tar.xz",
+            ArchiveKind::Gzip => "gzip",
+            ArchiveKind::Xz => "xz",
+            ArchiveKind::SevenZ => "7z",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArchiveEntryInfo {
+    index: usize,
+    path: String,
+    size: u64,
+}
+
+fn archive_kind_for_args(args: &Args, image_path: &Path) -> Result<Option<ArchiveKind>> {
+    let detected = archive_kind_from_path(image_path);
+
+    match args.archive {
+        ArchiveInputMode::No => {
+            if args.archive_entry.is_some() {
+                bail!("--archive-entry requires --archive yes or --archive auto");
+            }
+            Ok(None)
+        }
+        ArchiveInputMode::Auto => {
+            if args.archive_entry.is_some() && detected.is_none() {
+                bail!(
+                    "--archive-entry was provided, but {:?} does not have a supported archive extension ({})",
+                    image_path,
+                    supported_archive_extensions()
+                );
+            }
+            Ok(detected)
+        }
+        ArchiveInputMode::Yes => detected.map(Some).with_context(|| {
+            format!(
+                "Could not determine archive type from {:?}; supported extensions are {}",
+                image_path,
+                supported_archive_extensions()
+            )
+        }),
+    }
+}
+
+fn archive_kind_from_path(path: &Path) -> Option<ArchiveKind> {
+    let file_name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
+
+    if file_name.ends_with(".tar.gz") || file_name.ends_with(".tgz") {
+        Some(ArchiveKind::TarGz)
+    } else if file_name.ends_with(".tar.xz") || file_name.ends_with(".txz") {
+        Some(ArchiveKind::TarXz)
+    } else if file_name.ends_with(".tar") {
+        Some(ArchiveKind::Tar)
+    } else if file_name.ends_with(".zip") {
+        Some(ArchiveKind::Zip)
+    } else if file_name.ends_with(".7z") {
+        Some(ArchiveKind::SevenZ)
+    } else if file_name.ends_with(".gz") {
+        Some(ArchiveKind::Gzip)
+    } else if file_name.ends_with(".xz") {
+        Some(ArchiveKind::Xz)
+    } else {
+        None
+    }
+}
+
+fn supported_archive_extensions() -> &'static str {
+    ".zip, .7z, .tar, .tar.gz, .tgz, .tar.xz, .txz, .gz, .xz"
+}
+
+fn run_archive_sync_mode(
+    args: &Args,
+    disk_path: &str,
+    block_size: u64,
+    archive_path: &Path,
+    kind: ArchiveKind,
+) -> Result<()> {
+    let options = SyncOptions {
+        block_size,
+        verify_only: args.verify_only,
+        verify_writes: !args.no_verify_writes,
+    };
+
+    match kind {
+        ArchiveKind::Zip => {
+            run_zip_archive_sync(args, disk_path, block_size, archive_path, options)
+        }
+        ArchiveKind::Tar => run_tar_archive_sync(
+            args,
+            disk_path,
+            block_size,
+            archive_path,
+            kind,
+            File::open(archive_path)
+                .with_context(|| format!("Could not open archive {:?}", archive_path))?,
+            options,
+        ),
+        ArchiveKind::TarGz => run_tar_archive_sync(
+            args,
+            disk_path,
+            block_size,
+            archive_path,
+            kind,
+            GzDecoder::new(
+                File::open(archive_path)
+                    .with_context(|| format!("Could not open archive {:?}", archive_path))?,
+            ),
+            options,
+        ),
+        ArchiveKind::TarXz => run_tar_archive_sync(
+            args,
+            disk_path,
+            block_size,
+            archive_path,
+            kind,
+            XzReader::new(
+                File::open(archive_path)
+                    .with_context(|| format!("Could not open archive {:?}", archive_path))?,
+                true,
+            ),
+            options,
+        ),
+        ArchiveKind::Gzip => run_single_file_compressed_sync(
+            args,
+            disk_path,
+            block_size,
+            archive_path,
+            SingleFileCompressedInput {
+                kind: ArchiveKind::Gzip,
+                entry_name: gzip_entry_name(archive_path),
+            },
+            GzDecoder::new,
+            options,
+        ),
+        ArchiveKind::Xz => run_single_file_compressed_sync(
+            args,
+            disk_path,
+            block_size,
+            archive_path,
+            SingleFileCompressedInput {
+                kind: ArchiveKind::Xz,
+                entry_name: compressed_entry_name(archive_path, ".xz"),
+            },
+            |file| XzReader::new(file, true),
+            options,
+        ),
+        ArchiveKind::SevenZ => {
+            run_sevenz_archive_sync(args, disk_path, block_size, archive_path, options)
+        }
+    }
+}
+
+fn run_zip_archive_sync(
+    args: &Args,
+    disk_path: &str,
+    block_size: u64,
+    archive_path: &Path,
+    options: SyncOptions,
+) -> Result<()> {
+    let entries = list_zip_entries(archive_path)?;
+    let selected = choose_archive_entry(&entries, args.archive_entry.as_deref())?;
+
+    print_archive_sync_intro(
+        args,
+        disk_path,
+        block_size,
+        archive_path,
+        ArchiveKind::Zip,
+        &selected.path,
+        Some(selected.size),
+    );
+    print_disk_warning(args.disk);
+
+    let file = File::open(archive_path)
+        .with_context(|| format!("Could not open archive {:?}", archive_path))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("Could not read ZIP archive {:?}", archive_path))?;
+    let mut entry = archive
+        .by_index(selected.index)
+        .with_context(|| format!("Could not open ZIP entry {:?}", selected.path))?;
+    let mut disk = open_target_disk(args, disk_path)?;
+
+    sync_reader_with_progress(&mut entry, &mut disk, Some(selected.size), options)
+}
+
+fn list_zip_entries(archive_path: &Path) -> Result<Vec<ArchiveEntryInfo>> {
+    let file = File::open(archive_path)
+        .with_context(|| format!("Could not open archive {:?}", archive_path))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("Could not read ZIP archive {:?}", archive_path))?;
+    let mut entries = Vec::new();
+
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index(index)
+            .with_context(|| format!("Could not read ZIP entry header {}", index))?;
+
+        if entry.is_file() {
+            entries.push(ArchiveEntryInfo {
+                index,
+                path: normalize_archive_entry_path(entry.name()),
+                size: entry.size(),
+            });
+        }
+    }
+
+    Ok(entries)
+}
+
+fn run_tar_archive_sync<R>(
+    args: &Args,
+    disk_path: &str,
+    block_size: u64,
+    archive_path: &Path,
+    kind: ArchiveKind,
+    reader: R,
+    options: SyncOptions,
+) -> Result<()>
+where
+    R: Read,
+{
+    let mut archive = tar::Archive::new(reader);
+    let entries = archive
+        .entries()
+        .with_context(|| format!("Could not read {} archive {:?}", kind.label(), archive_path))?;
+    let requested = args.archive_entry.as_deref();
+
+    for entry in entries {
+        let mut entry =
+            entry.with_context(|| format!("Could not read archive entry in {:?}", archive_path))?;
+
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+
+        let entry_path = normalize_archive_entry_path(&entry.path()?.to_string_lossy());
+        let selected = match requested {
+            Some(requested) => archive_entry_path_matches(&entry_path, requested),
+            None => is_image_entry_name(&entry_path),
+        };
+
+        if !selected {
+            continue;
+        }
+
+        let entry_size = entry.size();
+        print_archive_sync_intro(
+            args,
+            disk_path,
+            block_size,
+            archive_path,
+            kind,
+            &entry_path,
+            Some(entry_size),
+        );
+        print_disk_warning(args.disk);
+
+        let mut disk = open_target_disk(args, disk_path)?;
+        return sync_reader_with_progress(&mut entry, &mut disk, Some(entry_size), options);
+    }
+
+    match requested {
+        Some(requested) => bail!(
+            "Archive {:?} does not contain requested entry {:?}",
+            archive_path,
+            requested
+        ),
+        None => bail!(
+            "Archive {:?} does not contain an image-like file entry; use --archive-entry to select one explicitly",
+            archive_path
+        ),
+    }
+}
+
+struct SingleFileCompressedInput {
+    kind: ArchiveKind,
+    entry_name: String,
+}
+
+fn run_single_file_compressed_sync<R, F>(
+    args: &Args,
+    disk_path: &str,
+    block_size: u64,
+    archive_path: &Path,
+    input: SingleFileCompressedInput,
+    make_reader: F,
+    options: SyncOptions,
+) -> Result<()>
+where
+    R: Read,
+    F: FnOnce(File) -> R,
+{
+    if args.archive_entry.is_some() {
+        bail!(
+            "--archive-entry is not supported for single-file {} input",
+            input.kind.label()
+        );
+    }
+
+    print_archive_sync_intro(
+        args,
+        disk_path,
+        block_size,
+        archive_path,
+        input.kind,
+        &input.entry_name,
+        None,
+    );
+    print_disk_warning(args.disk);
+
+    let file = File::open(archive_path).with_context(|| {
+        format!(
+            "Could not open {} input {:?}",
+            input.kind.label(),
+            archive_path
+        )
+    })?;
+    let mut image = make_reader(file);
+    let mut disk = open_target_disk(args, disk_path)?;
+
+    sync_reader_with_progress(&mut image, &mut disk, None, options)
+}
+
+fn run_sevenz_archive_sync(
+    args: &Args,
+    disk_path: &str,
+    block_size: u64,
+    archive_path: &Path,
+    options: SyncOptions,
+) -> Result<()> {
+    let file = File::open(archive_path)
+        .with_context(|| format!("Could not open archive {:?}", archive_path))?;
+    let archive_len = file
+        .metadata()
+        .with_context(|| format!("Could not stat archive {:?}", archive_path))?
+        .len();
+    let mut archive =
+        sevenz_rust::SevenZReader::new(file, archive_len, sevenz_rust::Password::empty())
+            .with_context(|| format!("Could not read 7z archive {:?}", archive_path))?;
+    let entries: Vec<ArchiveEntryInfo> = archive
+        .archive()
+        .files
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.has_stream() && !entry.is_directory())
+        .map(|(index, entry)| ArchiveEntryInfo {
+            index,
+            path: normalize_archive_entry_path(entry.name()),
+            size: entry.size(),
+        })
+        .collect();
+    let selected = choose_archive_entry(&entries, args.archive_entry.as_deref())?;
+
+    print_archive_sync_intro(
+        args,
+        disk_path,
+        block_size,
+        archive_path,
+        ArchiveKind::SevenZ,
+        &selected.path,
+        Some(selected.size),
+    );
+    print_disk_warning(args.disk);
+
+    let mut disk = open_target_disk(args, disk_path)?;
+    let mut found = false;
+
+    archive
+        .for_each_entries(|entry, reader| {
+            if entry.is_directory() || !entry.has_stream() {
+                return Ok(true);
+            }
+
+            if !archive_entry_path_matches(entry.name(), &selected.path) {
+                std::io::copy(reader, &mut std::io::sink()).map_err(sevenz_rust::Error::io)?;
+                return Ok(true);
+            }
+
+            found = true;
+            sync_reader_with_progress(reader, &mut disk, Some(entry.size()), options).map_err(
+                |err| {
+                    sevenz_rust::Error::io_msg(
+                        std::io::Error::other(err.to_string()),
+                        "sync selected 7z entry",
+                    )
+                },
+            )?;
+
+            Ok(false)
+        })
+        .with_context(|| format!("Could not stream 7z archive {:?}", archive_path))?;
+
+    if !found {
+        bail!(
+            "Archive {:?} does not contain selected entry {:?}",
+            archive_path,
+            selected.path
+        );
+    }
+
+    Ok(())
+}
+
+fn print_archive_sync_intro(
+    args: &Args,
+    disk_path: &str,
+    block_size: u64,
+    archive_path: &Path,
+    kind: ArchiveKind,
+    entry_path: &str,
+    image_size: Option<u64>,
+) {
+    println!("Archive:     {:?}", archive_path);
+    println!("Archive type: {}", kind.label());
+    println!("Archive entry: {}", entry_path);
+    println!("Target disk: {}", disk_path);
+    match image_size {
+        Some(image_size) => println!("Image size:  {} bytes", image_size),
+        None => println!("Image size:  unknown until decompression completes"),
+    }
+    println!("Block size:  {} bytes", block_size);
+    println!("Verify only: {}", args.verify_only);
+    println!();
+}
+
+fn choose_archive_entry(
+    entries: &[ArchiveEntryInfo],
+    requested: Option<&str>,
+) -> Result<ArchiveEntryInfo> {
+    if entries.is_empty() {
+        bail!("Archive does not contain any regular file entries");
+    }
+
+    if let Some(requested) = requested {
+        return entries
+            .iter()
+            .find(|entry| archive_entry_path_matches(&entry.path, requested))
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "Archive does not contain requested entry {:?}. Available entries: {}",
+                    requested,
+                    format_entry_list(entries)
+                )
+            });
+    }
+
+    let image_entries: Vec<&ArchiveEntryInfo> = entries
+        .iter()
+        .filter(|entry| is_image_entry_name(&entry.path))
+        .collect();
+
+    match image_entries.as_slice() {
+        [entry] => Ok((*entry).clone()),
+        [] if entries.len() == 1 => Ok(entries[0].clone()),
+        [] => bail!(
+            "Archive does not contain a file with a disk-image extension. Available entries: {}. Use --archive-entry to select one explicitly",
+            format_entry_list(entries)
+        ),
+        _ => bail!(
+            "Archive contains multiple image-like entries: {}. Use --archive-entry to select one explicitly",
+            format_entry_list_refs(&image_entries)
+        ),
+    }
+}
+
+fn is_image_entry_name(path: &str) -> bool {
+    let file_name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let Some((_, extension)) = file_name.rsplit_once('.') else {
+        return false;
+    };
+
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "img" | "raw" | "bin" | "iso" | "wic"
+    )
+}
+
+fn archive_entry_path_matches(actual: &str, requested: &str) -> bool {
+    normalize_archive_entry_path(actual) == normalize_archive_entry_path(requested)
+}
+
+fn normalize_archive_entry_path(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    normalized
+        .strip_prefix("./")
+        .unwrap_or(&normalized)
+        .to_owned()
+}
+
+fn gzip_entry_name(path: &Path) -> String {
+    compressed_entry_name(path, ".gz")
+}
+
+fn compressed_entry_name(path: &Path, suffix: &str) -> String {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "compressed stream".into());
+
+    if file_name.to_ascii_lowercase().ends_with(suffix) {
+        file_name[..file_name.len() - suffix.len()].to_owned()
+    } else {
+        file_name.into_owned()
+    }
+}
+
+fn format_entry_list(entries: &[ArchiveEntryInfo]) -> String {
+    let refs: Vec<&ArchiveEntryInfo> = entries.iter().collect();
+    format_entry_list_refs(&refs)
+}
+
+fn format_entry_list_refs(entries: &[&ArchiveEntryInfo]) -> String {
+    const MAX_ENTRIES: usize = 8;
+
+    let mut names: Vec<String> = entries
+        .iter()
+        .take(MAX_ENTRIES)
+        .map(|entry| format!("{:?}", entry.path))
+        .collect();
+
+    if entries.len() > MAX_ENTRIES {
+        names.push(format!("... and {} more", entries.len() - MAX_ENTRIES));
+    }
+
+    names.join(", ")
 }
 
 fn print_sync_summary(summary: SyncSummary) {
@@ -263,15 +873,30 @@ struct SyncProgressReporter {
 }
 
 impl SyncProgressReporter {
-    fn new(image_size: u64) -> Result<Self> {
-        let bar = ProgressBar::new(image_size);
-        bar.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({percent_precise}%) {bytes_per_sec} ETA {eta_precise} {msg}",
-            )
-            .context("Could not create progress bar style")?
-            .progress_chars("=>-"),
-        );
+    fn new(image_size: Option<u64>) -> Result<Self> {
+        let bar = match image_size {
+            Some(image_size) => {
+                let bar = ProgressBar::new(image_size);
+                bar.set_style(
+                    ProgressStyle::with_template(
+                        "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({percent_precise}%) {bytes_per_sec} ETA {eta_precise} {msg}",
+                    )
+                    .context("Could not create progress bar style")?
+                    .progress_chars("=>-"),
+                );
+                bar
+            }
+            None => {
+                let bar = ProgressBar::new_spinner();
+                bar.set_style(
+                    ProgressStyle::with_template(
+                        "{spinner:.green} [{elapsed_precise}] {bytes} {bytes_per_sec} {msg}",
+                    )
+                    .context("Could not create progress bar style")?,
+                );
+                bar
+            }
+        };
         bar.set_message("starting");
         bar.enable_steady_tick(Duration::from_millis(100));
 
@@ -306,7 +931,9 @@ impl SyncProgressReporter {
                 rewrite_bytes,
                 image_size,
             } => {
-                self.bar.set_length(image_size);
+                if let Some(image_size) = image_size {
+                    self.bar.set_length(image_size);
+                }
                 self.bar.set_position(checked_bytes);
                 self.bar.set_message(format!(
                     "diff {} | rewrite {}",
@@ -694,10 +1321,48 @@ fn sync_image_to_disk<I, D, F>(
     disk: &mut D,
     image_size: u64,
     options: SyncOptions,
+    report: F,
+) -> Result<SyncSummary>
+where
+    I: Read + ?Sized,
+    D: Read + Write + Seek,
+    F: FnMut(SyncEvent),
+{
+    sync_image_to_disk_stream(image, disk, Some(image_size), options, report)
+}
+
+fn sync_image_to_disk_stream<I, D, F>(
+    image: &mut I,
+    disk: &mut D,
+    image_size: Option<u64>,
+    options: SyncOptions,
+    report: F,
+) -> Result<SyncSummary>
+where
+    I: Read + ?Sized,
+    D: Read + Write + Seek,
+    F: FnMut(SyncEvent),
+{
+    sync_image_to_disk_stream_ordered(
+        image,
+        disk,
+        image_size,
+        options,
+        FirstBlockWriteOrder::Immediate,
+        report,
+    )
+}
+
+fn sync_image_to_disk_stream_ordered<I, D, F>(
+    image: &mut I,
+    disk: &mut D,
+    image_size: Option<u64>,
+    options: SyncOptions,
+    first_block_write_order: FirstBlockWriteOrder,
     mut report: F,
 ) -> Result<SyncSummary>
 where
-    I: Read,
+    I: Read + ?Sized,
     D: Read + Write + Seek,
     F: FnMut(SyncEvent),
 {
@@ -712,16 +1377,33 @@ where
 
     let mut offset: u64 = 0;
     let mut summary = SyncSummary::default();
+    let mut deferred_first_block: Option<Vec<u8>> = None;
 
-    while offset < image_size {
-        let remaining = image_size - offset;
-        let to_read = remaining.min(options.block_size) as usize;
+    loop {
+        let to_read = match image_size {
+            Some(image_size) => {
+                if offset >= image_size {
+                    break;
+                }
+
+                let remaining = image_size - offset;
+                remaining.min(options.block_size) as usize
+            }
+            None => block_size,
+        };
 
         let img_read = read_exact_or_eof(image, &mut img_buf[..to_read])
             .with_context(|| format!("Could not read image at offset {}", offset))?;
 
         if img_read == 0 {
             break;
+        }
+
+        if image_size.is_some() && img_read < to_read {
+            bail!(
+                "Image ended at offset {} before the expected size",
+                offset + img_read as u64
+            );
         }
 
         disk.seek(SeekFrom::Start(offset))
@@ -742,44 +1424,16 @@ where
                     offset,
                     length: img_read,
                 });
+            } else if offset == 0 && first_block_write_order == FirstBlockWriteOrder::Last {
+                deferred_first_block = Some(img_buf[..img_read].to_vec());
             } else {
-                disk.seek(SeekFrom::Start(offset)).with_context(|| {
-                    format!("Could not seek target disk to write offset {}", offset)
-                })?;
-
-                disk.write_all(&img_buf[..img_read])
-                    .with_context(|| format!("Could not write target disk at offset {}", offset))?;
-
-                disk.flush()
-                    .with_context(|| format!("Could not flush target disk at offset {}", offset))?;
-
-                if options.verify_writes {
-                    disk.seek(SeekFrom::Start(offset)).with_context(|| {
-                        format!("Could not seek target disk to verify offset {}", offset)
-                    })?;
-
-                    let mut verify_buf = vec![0u8; img_read];
-
-                    read_exact_full(disk, &mut verify_buf).with_context(|| {
-                        format!("Could not verify-read target disk at offset {}", offset)
-                    })?;
-
-                    if img_buf[..img_read] != verify_buf[..] {
-                        bail!("Verify mismatch at offset {}", offset);
-                    }
-
-                    report(SyncEvent::Wrote {
-                        offset,
-                        length: img_read,
-                        verified: true,
-                    });
-                } else {
-                    report(SyncEvent::Wrote {
-                        offset,
-                        length: img_read,
-                        verified: false,
-                    });
-                }
+                write_changed_block(
+                    disk,
+                    offset,
+                    &img_buf[..img_read],
+                    options.verify_writes,
+                    &mut report,
+                )?;
             }
         }
 
@@ -794,7 +1448,60 @@ where
         });
     }
 
+    if let Some(first_block) = deferred_first_block {
+        write_changed_block(disk, 0, &first_block, options.verify_writes, &mut report)?;
+    }
+
     Ok(summary)
+}
+
+fn write_changed_block<D, F>(
+    disk: &mut D,
+    offset: u64,
+    bytes: &[u8],
+    verify_writes: bool,
+    report: &mut F,
+) -> Result<()>
+where
+    D: Read + Write + Seek,
+    F: FnMut(SyncEvent),
+{
+    disk.seek(SeekFrom::Start(offset))
+        .with_context(|| format!("Could not seek target disk to write offset {}", offset))?;
+
+    disk.write_all(bytes)
+        .with_context(|| format!("Could not write target disk at offset {}", offset))?;
+
+    disk.flush()
+        .with_context(|| format!("Could not flush target disk at offset {}", offset))?;
+
+    if verify_writes {
+        disk.seek(SeekFrom::Start(offset))
+            .with_context(|| format!("Could not seek target disk to verify offset {}", offset))?;
+
+        let mut verify_buf = vec![0u8; bytes.len()];
+
+        read_exact_full(disk, &mut verify_buf)
+            .with_context(|| format!("Could not verify-read target disk at offset {}", offset))?;
+
+        if bytes != verify_buf {
+            bail!("Verify mismatch at offset {}", offset);
+        }
+
+        report(SyncEvent::Wrote {
+            offset,
+            length: bytes.len(),
+            verified: true,
+        });
+    } else {
+        report(SyncEvent::Wrote {
+            offset,
+            length: bytes.len(),
+            verified: false,
+        });
+    }
+
+    Ok(())
 }
 
 fn count_differing_bytes(left: &[u8], right: &[u8]) -> usize {
@@ -806,7 +1513,7 @@ fn count_differing_bytes(left: &[u8], right: &[u8]) -> usize {
 
 /// Reads until the buffer is full or EOF is reached.
 /// Returns how many bytes were read.
-fn read_exact_or_eof<R: Read>(reader: &mut R, mut buf: &mut [u8]) -> Result<usize> {
+fn read_exact_or_eof<R: Read + ?Sized>(reader: &mut R, mut buf: &mut [u8]) -> Result<usize> {
     let original_len = buf.len();
     let mut total = 0;
 
@@ -829,7 +1536,7 @@ fn read_exact_or_eof<R: Read>(reader: &mut R, mut buf: &mut [u8]) -> Result<usiz
 }
 
 /// Reads exactly the full buffer or returns an error.
-fn read_exact_full<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<()> {
+fn read_exact_full<R: Read + ?Sized>(reader: &mut R, buf: &mut [u8]) -> Result<()> {
     reader.read_exact(buf)?;
     Ok(())
 }
@@ -860,6 +1567,8 @@ mod tests {
         assert_eq!(args.image, Some(PathBuf::from(r"C:\images\sdcard.img")));
         assert_eq!(args.disk, 7);
         assert_eq!(args.block_size_mib, 4);
+        assert_eq!(args.archive, ArchiveInputMode::Auto);
+        assert_eq!(args.archive_entry, None);
         assert!(!args.verify_only);
         assert!(!args.no_verify_writes);
         assert!(!args.manual_test);
@@ -875,12 +1584,18 @@ mod tests {
             "1",
             "--block-size-mib",
             "16",
+            "--archive",
+            "yes",
+            "--archive-entry",
+            "images/sdcard.img",
             "--verify-only",
             "--no-verify-writes",
         ])
         .unwrap();
 
         assert_eq!(args.block_size_mib, 16);
+        assert_eq!(args.archive, ArchiveInputMode::Yes);
+        assert_eq!(args.archive_entry.as_deref(), Some("images/sdcard.img"));
         assert!(args.verify_only);
         assert!(args.no_verify_writes);
         assert!(!args.manual_test);
@@ -903,6 +1618,22 @@ mod tests {
     }
 
     #[test]
+    fn cli_rejects_unknown_archive_mode() {
+        let err = Args::try_parse_from([
+            "bim-sync",
+            "--image",
+            r"C:\images\sdcard.img.zip",
+            "--disk",
+            "1",
+            "--archive",
+            "maybe",
+        ])
+        .unwrap_err();
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
     fn cli_rejects_manual_test_with_normal_sync_args() {
         let err = Args::try_parse_from([
             "bim-sync",
@@ -915,6 +1646,100 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn archive_kind_detection_uses_supported_suffixes() {
+        assert_eq!(
+            archive_kind_from_path(Path::new(r"C:\images\sdcard.img.zip")),
+            Some(ArchiveKind::Zip)
+        );
+        assert_eq!(
+            archive_kind_from_path(Path::new(r"C:\images\sdcard.tar.gz")),
+            Some(ArchiveKind::TarGz)
+        );
+        assert_eq!(
+            archive_kind_from_path(Path::new(r"C:\images\sdcard.tgz")),
+            Some(ArchiveKind::TarGz)
+        );
+        assert_eq!(
+            archive_kind_from_path(Path::new(r"C:\images\sdcard.tar.xz")),
+            Some(ArchiveKind::TarXz)
+        );
+        assert_eq!(
+            archive_kind_from_path(Path::new(r"C:\images\sdcard.txz")),
+            Some(ArchiveKind::TarXz)
+        );
+        assert_eq!(
+            archive_kind_from_path(Path::new(r"C:\images\sdcard.7z")),
+            Some(ArchiveKind::SevenZ)
+        );
+        assert_eq!(
+            archive_kind_from_path(Path::new(r"C:\images\sdcard.img.gz")),
+            Some(ArchiveKind::Gzip)
+        );
+        assert_eq!(
+            archive_kind_from_path(Path::new(r"C:\images\sdcard.img.xz")),
+            Some(ArchiveKind::Xz)
+        );
+        assert_eq!(
+            archive_kind_from_path(Path::new(r"C:\images\sdcard.img")),
+            None
+        );
+    }
+
+    #[test]
+    fn archive_entry_selection_prefers_disk_image_extension() {
+        let entries = vec![
+            ArchiveEntryInfo {
+                index: 0,
+                path: "README.txt".to_string(),
+                size: 12,
+            },
+            ArchiveEntryInfo {
+                index: 1,
+                path: "images/sdcard.img".to_string(),
+                size: 128,
+            },
+        ];
+
+        let selected = choose_archive_entry(&entries, None).unwrap();
+
+        assert_eq!(selected.path, "images/sdcard.img");
+        assert_eq!(selected.size, 128);
+    }
+
+    #[test]
+    fn archive_entry_selection_allows_explicit_path() {
+        let entries = vec![ArchiveEntryInfo {
+            index: 4,
+            path: "images/sdcard.img".to_string(),
+            size: 128,
+        }];
+
+        let selected = choose_archive_entry(&entries, Some(r"images\sdcard.img")).unwrap();
+
+        assert_eq!(selected.index, 4);
+    }
+
+    #[test]
+    fn archive_entry_selection_rejects_ambiguous_images() {
+        let entries = vec![
+            ArchiveEntryInfo {
+                index: 0,
+                path: "a.img".to_string(),
+                size: 1,
+            },
+            ArchiveEntryInfo {
+                index: 1,
+                path: "b.raw".to_string(),
+                size: 1,
+            },
+        ];
+
+        let err = choose_archive_entry(&entries, None).unwrap_err();
+
+        assert!(err.to_string().contains("multiple image-like entries"));
     }
 
     #[test]
@@ -1107,6 +1932,74 @@ mod tests {
 
         assert_eq!(summary.checked_bytes, 5);
         assert_eq!(positions, vec![2, 4, 5]);
+    }
+
+    #[test]
+    fn streaming_sync_can_read_until_eof_without_known_size() {
+        let image_bytes = vec![1, 2, 3, 4, 5];
+        let mut image = Cursor::new(image_bytes.clone());
+        let mut disk = Cursor::new(vec![0; image_bytes.len()]);
+        let mut events = Vec::new();
+
+        let summary = sync_image_to_disk_stream(
+            &mut image,
+            &mut disk,
+            None,
+            SyncOptions {
+                block_size: 2,
+                verify_only: false,
+                verify_writes: true,
+            },
+            |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(summary.checked_bytes, 5);
+        assert_eq!(disk.into_inner(), image_bytes);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                SyncEvent::Progress {
+                    checked_bytes: 5,
+                    image_size: None,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn ordered_streaming_sync_writes_first_block_last() {
+        let image_bytes = vec![1, 2, 3, 4, 5, 6];
+        let mut image = Cursor::new(image_bytes.clone());
+        let mut disk = Cursor::new(vec![0; image_bytes.len()]);
+        let mut events = Vec::new();
+
+        let summary = sync_image_to_disk_stream_ordered(
+            &mut image,
+            &mut disk,
+            None,
+            SyncOptions {
+                block_size: 2,
+                verify_only: false,
+                verify_writes: true,
+            },
+            FirstBlockWriteOrder::Last,
+            |event| events.push(event),
+        )
+        .unwrap();
+
+        let wrote_offsets: Vec<u64> = events
+            .iter()
+            .filter_map(|event| match event {
+                SyncEvent::Wrote { offset, .. } => Some(*offset),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(disk.into_inner(), image_bytes);
+        assert_eq!(summary.checked_bytes, 6);
+        assert_eq!(wrote_offsets, vec![2, 4, 0]);
     }
 
     #[test]

@@ -11,6 +11,8 @@ This is useful when repeatedly flashing mostly unchanged SD card images and you 
 ## Features
 
 - Writes a raw `.img` file to a Windows physical disk
+- Streams an image out of `.zip`, `.7z`, `.tar`, `.tar.gz`, `.tgz`,
+  `.tar.xz`, `.txz`, `.gz`, or `.xz` input
 - Compares before writing
 - Writes only changed blocks
 - Supports dry-run comparison mode
@@ -145,6 +147,48 @@ To write only changed blocks and verify each written block:
 .\target\release\bim-sync.exe --image C:\path\sdcard.img --disk 1
 ```
 
+## Sync Image From Archive
+
+By default, `--archive auto` treats inputs with archive-like extensions as
+archives and all other inputs as raw images. Supported archive inputs are:
+
+```text
+.zip, .7z, .tar, .tar.gz, .tgz, .tar.xz, .txz, .gz, .xz
+```
+
+Examples:
+
+```powershell
+.\target\release\bim-sync.exe --image C:\path\sdcard.zip --disk 1
+.\target\release\bim-sync.exe --image C:\path\sdcard.tar.gz --disk 1
+.\target\release\bim-sync.exe --image C:\path\sdcard.img.xz --disk 1
+.\target\release\bim-sync.exe --image C:\path\sdcard.7z --disk 1
+```
+
+You can force archive handling or force raw-image handling:
+
+```powershell
+.\target\release\bim-sync.exe --image C:\path\sdcard.zip --disk 1 --archive yes
+.\target\release\bim-sync.exe --image C:\path\sdcard.img --disk 1 --archive no
+```
+
+For `.zip` and `.7z`, `bim-sync` selects the only regular file if the archive
+contains one file, otherwise it selects a single image-like entry such as
+`.img`, `.raw`, `.bin`, `.iso`, or `.wic`. If the archive is ambiguous, choose
+the entry explicitly:
+
+```powershell
+.\target\release\bim-sync.exe --image C:\path\sdcard.zip --disk 1 --archive-entry images/sdcard.img
+```
+
+For `.tar`, `.tar.gz`, and `.tar.xz`, automatic selection streams the first
+image-like file entry. Use `--archive-entry` for archives whose image entry has
+another name.
+
+Archive entries and single-file compressed streams are streamed directly into
+the block comparison loop. The tool does not write a temporary uncompressed
+image file to disk.
+
 ## Manual SD-Card Test Mode
 
 Manual test mode writes a generated two-block test image to the beginning of the target disk, verifies it, modifies 32 bytes in one block, verifies that the difference is detected, repairs the disk by syncing the generated image again, and verifies the repaired result.
@@ -234,7 +278,7 @@ Set-Disk -Number $diskNumber -IsReadOnly $false
 
 For each block:
 
-1. Read a block from the image file.
+1. Read a block from the image file, or from the selected archive entry.
 2. Read the corresponding block from the target disk.
 3. Compare both blocks.
 4. If they are identical, skip the block.
@@ -242,6 +286,11 @@ For each block:
 6. Read the block back and verify it, unless `--no-verify-writes` is used.
 
 This means the tool still reads the whole image and the corresponding target area, but it avoids unnecessary writes.
+
+During normal sync, changed bytes in the first sync block are buffered and
+written last. This keeps the new image partition table off the target until the
+rest of the stream has been written, reducing Windows auto-mount races on
+removable media.
 
 Progress and summaries report both exact byte differences and bytes in
 differing blocks. Writes happen at block granularity, so a block with only a few
@@ -257,6 +306,8 @@ different bytes still causes the whole block to be rewritten.
 - It does not currently zero or truncate data beyond the end of the image.
 - Windows may block raw writes if the disk is online or mounted.
 - The tool is Windows-oriented because it targets paths like `\\.\PhysicalDrive1`.
+- Archive auto-detection is extension-based. Use `--archive yes` or
+  `--archive no` when the extension is misleading.
 
 ## When This Is Useful
 
@@ -273,7 +324,8 @@ Less suitable use cases:
 - Updating a mounted filesystem
 - Resizing images or partitions
 - Copying only used filesystem blocks
-- Flashing compressed images directly
+- Flashing archives that contain several possible disk images without choosing
+  one with `--archive-entry`
 
 ## File-Level Alternative
 
