@@ -1647,11 +1647,16 @@ fn run_powershell(script: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+#[cfg(windows)]
 fn powershell_command() -> Command {
     let mut command = Command::new("powershell.exe");
-    #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
     command
+}
+
+#[cfg(not(windows))]
+fn powershell_command() -> Command {
+    Command::new("powershell.exe")
 }
 
 fn format_bytes(bytes: u64) -> String {
