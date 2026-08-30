@@ -207,6 +207,7 @@ struct GuiState {
     manual_test: bool,
     confirmed: bool,
     is_admin: bool,
+    choosing_image: bool,
     running: bool,
     cancel: Option<Arc<AtomicBool>>,
     receiver: Option<mpsc::Receiver<WorkerEvent>>,
@@ -231,6 +232,7 @@ impl GuiState {
             manual_test: false,
             confirmed: false,
             is_admin: is_administrator(),
+            choosing_image: false,
             running: false,
             cancel: None,
             receiver: None,
@@ -251,6 +253,7 @@ impl GuiState {
 #[derive(Clone, Debug)]
 enum Message {
     ChooseImage,
+    ImageChosen(Option<PathBuf>),
     RefreshDisks,
     SelectDisk(DiskChoice),
     SelectArchiveEntry(String),
@@ -373,7 +376,17 @@ impl BimSyncApp {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::ChooseImage => choose_image(&mut self.state),
+            Message::ChooseImage => {
+                if self.state.choosing_image {
+                    return Task::none();
+                }
+                self.state.choosing_image = true;
+                return Task::perform(pick_image(), Message::ImageChosen);
+            }
+            Message::ImageChosen(path) => {
+                self.state.choosing_image = false;
+                choose_image(&mut self.state, path);
+            }
             Message::RefreshDisks => refresh_disks(&mut self.state),
             Message::SelectDisk(choice) => {
                 self.state.selected_disk = self
@@ -473,8 +486,12 @@ impl BimSyncApp {
                 )
             });
 
-        let mut image_button = button("Choose image…");
-        if !self.state.running {
+        let mut image_button = button(if self.state.choosing_image {
+            "Opening image picker…"
+        } else {
+            "Choose image…"
+        });
+        if !self.state.running && !self.state.choosing_image {
             image_button = image_button.on_press(Message::ChooseImage);
         }
         let archive_entry_control: Element<'_, Message> = if archive_entries.len() > 1 {
@@ -817,15 +834,20 @@ fn app_theme(_: &BimSyncApp) -> Theme {
     Theme::Dark
 }
 
-fn choose_image(state: &mut GuiState) {
-    let path = rfd::FileDialog::new()
+async fn pick_image() -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new()
         .add_filter(
             "Images and archives",
             &[
                 "img", "raw", "bin", "iso", "wic", "zip", "7z", "tar", "gz", "tgz", "xz", "txz",
             ],
         )
-        .pick_file();
+        .pick_file()
+        .await
+        .map(|file| file.path().to_owned())
+}
+
+fn choose_image(state: &mut GuiState, path: Option<PathBuf>) {
     let Some(path) = path else {
         return;
     };
@@ -1629,6 +1651,7 @@ mod tests {
             manual_test: false,
             confirmed: false,
             is_admin: true,
+            choosing_image: false,
             running: false,
             cancel: None,
             receiver: None,
