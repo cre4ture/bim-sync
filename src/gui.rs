@@ -5,12 +5,17 @@ use iced::widget::{
 };
 use iced::{time, Alignment, Element, Length, Subscription, Task, Theme};
 use serde_json::Value;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Clone, Debug)]
 struct DiskInfo {
@@ -196,6 +201,14 @@ enum JobResult {
     Manual(ManualTestSummary),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartupPhase {
+    Pending,
+    CheckingAdministrator,
+    DiscoveringDisks,
+    Ready,
+}
+
 struct GuiState {
     source: Option<SourceSelection>,
     disks: Vec<DiskInfo>,
@@ -207,6 +220,8 @@ struct GuiState {
     manual_test: bool,
     confirmed: bool,
     is_admin: bool,
+    startup: StartupPhase,
+    refreshing_disks: bool,
     choosing_image: bool,
     running: bool,
     cancel: Option<Arc<AtomicBool>>,
@@ -231,7 +246,9 @@ impl GuiState {
             verify_writes: true,
             manual_test: false,
             confirmed: false,
-            is_admin: is_administrator(),
+            is_admin: false,
+            startup: StartupPhase::Pending,
+            refreshing_disks: false,
             choosing_image: false,
             running: false,
             cancel: None,
@@ -252,6 +269,10 @@ impl GuiState {
 
 #[derive(Clone, Debug)]
 enum Message {
+    BeginStartup,
+    AdministratorChecked(bool),
+    DisksDiscovered(Result<Vec<DiskInfo>, String>),
+    DisksRefreshed(Result<Vec<DiskInfo>, String>),
     ChooseImage,
     ImageChosen(Option<PathBuf>),
     RefreshDisks,
@@ -369,13 +390,33 @@ struct BimSyncApp {
 
 impl BimSyncApp {
     fn new() -> Self {
-        let mut state = GuiState::new();
-        refresh_disks(&mut state);
-        Self { state }
+        Self {
+            state: GuiState::new(),
+        }
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::BeginStartup => {
+                if self.state.startup != StartupPhase::Pending {
+                    return Task::none();
+                }
+                self.state.startup = StartupPhase::CheckingAdministrator;
+                return Task::perform(async { is_administrator() }, Message::AdministratorChecked);
+            }
+            Message::AdministratorChecked(is_admin) => {
+                self.state.is_admin = is_admin;
+                self.state.startup = StartupPhase::DiscoveringDisks;
+                return Task::perform(discover_disks_async(), Message::DisksDiscovered);
+            }
+            Message::DisksDiscovered(result) => {
+                self.state.startup = StartupPhase::Ready;
+                apply_discovered_disks(&mut self.state, result);
+            }
+            Message::DisksRefreshed(result) => {
+                self.state.refreshing_disks = false;
+                apply_discovered_disks(&mut self.state, result);
+            }
             Message::ChooseImage => {
                 if self.state.choosing_image {
                     return Task::none();
@@ -387,7 +428,13 @@ impl BimSyncApp {
                 self.state.choosing_image = false;
                 choose_image(&mut self.state, path);
             }
-            Message::RefreshDisks => refresh_disks(&mut self.state),
+            Message::RefreshDisks => {
+                if self.state.refreshing_disks {
+                    return Task::none();
+                }
+                self.state.refreshing_disks = true;
+                return Task::perform(discover_disks_async(), Message::DisksRefreshed);
+            }
             Message::SelectDisk(choice) => {
                 self.state.selected_disk = self
                     .state
@@ -428,14 +475,24 @@ impl BimSyncApp {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        if self.state.receiver.is_some() {
+        let startup = if self.state.startup == StartupPhase::Pending {
+            time::every(Duration::from_millis(10)).map(|_| Message::BeginStartup)
+        } else {
+            Subscription::none()
+        };
+        let worker = if self.state.receiver.is_some() {
             time::every(Duration::from_millis(100)).map(|_| Message::Tick)
         } else {
             Subscription::none()
-        }
+        };
+        Subscription::batch([startup, worker])
     }
 
     fn view(&self) -> Element<'_, Message> {
+        if self.state.startup != StartupPhase::Ready {
+            return startup_view(self.state.startup);
+        }
+
         let disk_choices: Vec<_> = self
             .state
             .disks
@@ -532,8 +589,12 @@ impl BimSyncApp {
             .spacing(7),
         );
 
-        let mut refresh_button = button("Refresh");
-        if !self.state.running {
+        let mut refresh_button = button(if self.state.refreshing_disks {
+            "Refreshing…"
+        } else {
+            "Refresh"
+        });
+        if !self.state.running && !self.state.refreshing_disks {
             refresh_button = refresh_button.on_press(Message::RefreshDisks);
         }
         let target_section = section(
@@ -652,6 +713,30 @@ impl BimSyncApp {
             .height(Length::Fill)
             .into()
     }
+}
+
+fn startup_view(phase: StartupPhase) -> Element<'static, Message> {
+    let status = match phase {
+        StartupPhase::Pending => "Starting BIM Sync…",
+        StartupPhase::CheckingAdministrator => "Checking administrator permissions…",
+        StartupPhase::DiscoveringDisks => "Discovering physical disks…",
+        StartupPhase::Ready => "Ready.",
+    };
+    container(
+        column![
+            text("BIM Sync").size(26),
+            text(status).size(16),
+            text("Please wait while Windows is queried for the available target disks.").size(14),
+        ]
+        .spacing(8)
+        .width(440),
+    )
+    .padding(24)
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .center_x(Length::Fill)
+    .center_y(Length::Fill)
+    .into()
 }
 
 fn administrator_status(is_admin: bool) -> Element<'static, Message> {
@@ -867,8 +952,12 @@ fn choose_image(state: &mut GuiState, path: Option<PathBuf>) {
     }
 }
 
-fn refresh_disks(state: &mut GuiState) {
-    match discover_disks() {
+async fn discover_disks_async() -> Result<Vec<DiskInfo>, String> {
+    discover_disks().map_err(|error| error.to_string())
+}
+
+fn apply_discovered_disks(state: &mut GuiState, result: Result<Vec<DiskInfo>, String>) {
+    match result {
         Ok(disks) => {
             let selected_number = state.selected_disk().map(|disk| disk.number);
             state.disks = disks;
@@ -1525,7 +1614,7 @@ fn is_administrator() -> bool {
 fn restart_as_administrator() -> Result<()> {
     let exe = std::env::current_exe().context("Could not locate bim-sync-gui.exe")?;
     let escaped = exe.to_string_lossy().replace('\'', "''");
-    Command::new("powershell.exe")
+    powershell_command()
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -1538,7 +1627,7 @@ fn restart_as_administrator() -> Result<()> {
 }
 
 fn run_powershell(script: &str) -> Result<String> {
-    let output = Command::new("powershell.exe")
+    let output = powershell_command()
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -1556,6 +1645,13 @@ fn run_powershell(script: &str) -> Result<String> {
         )
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn powershell_command() -> Command {
+    let mut command = Command::new("powershell.exe");
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -1651,6 +1747,8 @@ mod tests {
             manual_test: false,
             confirmed: false,
             is_admin: true,
+            startup: StartupPhase::Ready,
+            refreshing_disks: false,
             choosing_image: false,
             running: false,
             cancel: None,

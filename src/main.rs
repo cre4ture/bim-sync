@@ -12,9 +12,9 @@ use std::time::Duration;
 #[cfg(windows)]
 use std::ffi::c_void;
 #[cfg(windows)]
-use std::os::windows::fs::OpenOptionsExt;
-#[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use std::os::windows::{fs::OpenOptionsExt, process::CommandExt};
 #[cfg(windows)]
 use std::process::Command;
 
@@ -114,6 +114,8 @@ impl Drop for VolumeLock {
 #[cfg(windows)]
 const FILE_SHARE_READ_WRITE: u32 = 0x0000_0003;
 #[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(windows)]
 const FSCTL_LOCK_VOLUME: u32 = 0x0009_0018;
 #[cfg(windows)]
 const FSCTL_UNLOCK_VOLUME: u32 = 0x0009_001c;
@@ -160,7 +162,8 @@ fn volume_paths_for_disk(disk_number: u32) -> Result<Vec<String>> {
     let script = format!(
         r#"$ErrorActionPreference = 'Stop'; $disk = Get-Disk -Number {disk_number}; if (-not $disk.IsOffline) {{ Get-Partition -DiskNumber {disk_number} -ErrorAction SilentlyContinue | ForEach-Object {{ $_.AccessPaths | Where-Object {{ [string]$_ -like '\\?\Volume{{*' }} }} | Sort-Object -Unique }}"#
     );
-    let output = Command::new("powershell.exe")
+    let mut command = Command::new("powershell.exe");
+    command
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -169,6 +172,8 @@ fn volume_paths_for_disk(disk_number: u32) -> Result<Vec<String>> {
             "-Command",
             &script,
         ])
+        .creation_flags(CREATE_NO_WINDOW);
+    let output = command
         .output()
         .context("Could not inspect target volumes before writing")?;
     if !output.status.success() {
