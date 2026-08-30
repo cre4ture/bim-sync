@@ -1,249 +1,16 @@
 use super::*;
 use anyhow::{Context, Result};
+use iced::widget::{
+    button, checkbox, column, container, pick_list, progress_bar, row, scrollable, text,
+};
+use iced::{time, Alignment, Element, Length, Subscription, Task, Theme};
 use serde_json::Value;
-use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
-use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
-
-slint::slint! {
-    import { Button, CheckBox, ComboBox, GroupBox, ProgressIndicator, ScrollView, VerticalBox, HorizontalBox } from "std-widgets.slint";
-
-    component CompactButton inherits Button {
-        height: 34px;
-    }
-
-    component CompactComboBox inherits ComboBox {
-        height: 34px;
-    }
-
-    component CompactCheckBox inherits CheckBox {
-        height: 26px;
-    }
-
-    export component MainWindow inherits Window {
-        title: "BIM Sync";
-        preferred-width: 900px;
-        preferred-height: 810px;
-        min-width: 720px;
-        min-height: 680px;
-
-        in-out property <string> image-path: "";
-        in-out property <string> image-details: "Choose a raw image or supported archive.";
-        in-out property <[string]> disk-options: ["Select a target disk…"];
-        in-out property <int> selected-disk-index: 0;
-        in-out property <string> disk-details: "No physical disk selected.";
-        in-out property <[string]> archive-entries: [];
-        in-out property <int> selected-entry-index: 0;
-        in-out property <bool> has-entry-choice: false;
-        in-out property <int> archive-mode-index: 0;
-        in-out property <int> block-size-index: 1;
-        in-out property <bool> write-mode: false;
-        in-out property <bool> verify-writes: true;
-        in-out property <bool> manual-test: false;
-        in-out property <bool> confirmed: false;
-        in-out property <bool> running: false;
-        in-out property <bool> can-start: false;
-        in-out property <bool> can-stop: false;
-        in-out property <bool> can-prepare: false;
-        in-out property <bool> can-restore: false;
-        in-out property <bool> is-admin: false;
-        in-out property <string> preflight: "Choose an image and target disk to begin.";
-        in-out property <bool> preflight-error: false;
-        in-out property <string> notice: "";
-        in-out property <bool> notice-error: false;
-        in-out property <float> progress: 0;
-        in-out property <string> progress-details: "";
-        in-out property <string> action-label: "Compare selected disk";
-
-        callback choose-image();
-        callback refresh-disks();
-        callback select-disk(int);
-        callback select-entry(int);
-        callback set-archive-mode(int);
-        callback set-block-size(int);
-        callback set-write-mode(bool);
-        callback set-verify-writes(bool);
-        callback set-manual-test(bool);
-        callback set-confirmed(bool);
-        callback prepare-target();
-        callback restore-target();
-        callback restart-as-admin();
-        callback start-job();
-        callback stop-job();
-
-        ScrollView {
-            mouse-drag-pan-enabled: true;
-            VerticalBox {
-                padding: 12px;
-                spacing: 7px;
-                alignment: start;
-
-            Text {
-                text: "BIM Sync";
-                font-size: 28px;
-                font-weight: 700;
-            }
-            Text {
-                text: "Incrementally compare and sync raw disk images without rewriting unchanged blocks.";
-                color: #5d6673;
-                wrap: word-wrap;
-            }
-
-            GroupBox {
-                title: "1. Image";
-                VerticalBox {
-                    spacing: 4px;
-                    alignment: start;
-                    HorizontalBox {
-                        Text {
-                            text: root.image-path == "" ? "No image selected" : root.image-path;
-                            vertical-alignment: center;
-                            overflow: elide;
-                        }
-                        CompactButton { width: 170px; text: "Choose image…"; clicked => { root.choose-image(); } }
-                    }
-                    Text { text: root.image-details; color: #5d6673; wrap: word-wrap; }
-                    HorizontalBox {
-                        Text { text: "Input type"; vertical-alignment: center; }
-                        CompactComboBox {
-                            model: ["Auto-detect", "Treat as raw image", "Treat as archive"];
-                            current-index <=> root.archive-mode-index;
-                            selected(value) => { root.set-archive-mode(self.current-index); }
-                        }
-                        Text { text: "Archive entry"; visible: root.has-entry-choice; vertical-alignment: center; }
-                        CompactComboBox {
-                            visible: root.has-entry-choice;
-                            model: root.archive-entries;
-                            current-index <=> root.selected-entry-index;
-                            selected(value) => { root.select-entry(self.current-index); }
-                        }
-                    }
-                }
-            }
-
-            GroupBox {
-                title: "2. Target disk";
-                VerticalBox {
-                    spacing: 4px;
-                    alignment: start;
-                    HorizontalBox {
-                        CompactComboBox {
-                            model: root.disk-options;
-                            current-index <=> root.selected-disk-index;
-                            enabled: !root.running;
-                            selected(value) => { root.select-disk(self.current-index); }
-                        }
-                        CompactButton { width: 100px; text: "Refresh"; enabled: !root.running; clicked => { root.refresh-disks(); } }
-                        CompactButton { width: 130px; text: "Prepare target"; enabled: root.can-prepare; clicked => { root.prepare-target(); } }
-                        CompactButton { width: 120px; text: "Bring online"; visible: root.can-restore; enabled: !root.running; clicked => { root.restore-target(); } }
-                    }
-                    Text { text: root.disk-details; color: #5d6673; wrap: word-wrap; }
-                }
-            }
-
-            GroupBox {
-                title: "3. Operation";
-                VerticalBox {
-                    spacing: 3px;
-                    alignment: start;
-                    CompactCheckBox {
-                        text: "Write changed blocks (otherwise compare only)";
-                        checked: root.write-mode;
-                        enabled: !root.running && !root.manual-test;
-                        toggled => { root.set-write-mode(self.checked); }
-                    }
-                    CompactCheckBox {
-                        text: "Verify every block after writing (recommended)";
-                        checked: root.verify-writes;
-                        enabled: !root.running && root.write-mode && !root.manual-test;
-                        toggled => { root.set-verify-writes(self.checked); }
-                    }
-                    CompactCheckBox {
-                        text: "Run destructive two-block diagnostic on a disposable removable card";
-                        checked: root.manual-test;
-                        enabled: !root.running;
-                        toggled => { root.set-manual-test(self.checked); }
-                    }
-                    CompactCheckBox {
-                        text: root.manual-test ? "I confirm this is a disposable card" : "I have verified the selected target disk";
-                        checked: root.confirmed;
-                        visible: root.write-mode || root.manual-test;
-                        enabled: !root.running;
-                        toggled => { root.set-confirmed(self.checked); }
-                    }
-                    HorizontalBox {
-                        Text { text: "Block size"; vertical-alignment: center; }
-                        CompactComboBox {
-                            model: ["1 MiB — precise", "4 MiB — balanced", "16 MiB — faster"];
-                            current-index <=> root.block-size-index;
-                            enabled: !root.running;
-                            selected(value) => { root.set-block-size(self.current-index); }
-                        }
-                        Text {
-                            text: root.is-admin ? "Administrator: ready" : "Administrator rights required";
-                            color: root.is-admin ? #287a42 : #b45309;
-                            vertical-alignment: center;
-                        }
-                        CompactButton {
-                            width: 200px;
-                            text: "Restart as administrator";
-                            visible: !root.is-admin;
-                            enabled: !root.running;
-                            clicked => { root.restart-as-admin(); }
-                        }
-                    }
-                }
-            }
-
-            GroupBox {
-                title: "Readiness";
-                Text {
-                    text: root.preflight;
-                    color: root.preflight-error ? #b42318 : #287a42;
-                    wrap: word-wrap;
-                }
-            }
-
-            GroupBox {
-                title: "Progress";
-                VerticalBox {
-                    spacing: 4px;
-                    alignment: start;
-                    ProgressIndicator { height: 8px; progress: root.progress; }
-                    Text { text: root.progress-details; wrap: word-wrap; color: #374151; }
-                    HorizontalBox {
-                        CompactButton {
-                            width: 190px;
-                            text: root.action-label;
-                            enabled: root.can-start;
-                            clicked => { root.start-job(); }
-                        }
-                        CompactButton {
-                            width: 110px;
-                            text: "Stop safely";
-                            visible: root.running;
-                            enabled: root.can-stop;
-                            clicked => { root.stop-job(); }
-                        }
-                    }
-                }
-            }
-
-                Text {
-                    text: root.notice;
-                    color: root.notice-error ? #b42318 : #374151;
-                    wrap: word-wrap;
-                }
-            }
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 struct DiskInfo {
@@ -421,8 +188,6 @@ enum WorkerEvent {
     Started { total: Option<u64>, label: String },
     Sync(SyncEvent),
     Manual(ManualTestEvent),
-    Prepared(Result<String, String>),
-    Restored(Result<String, String>),
     Finished(Result<JobResult, String>),
 }
 
@@ -451,7 +216,6 @@ struct GuiState {
     progress_details: String,
     notice: String,
     notice_error: bool,
-    timer: Timer,
 }
 
 impl GuiState {
@@ -476,7 +240,6 @@ impl GuiState {
             progress_details: "No operation running.".to_owned(),
             notice: String::new(),
             notice_error: false,
-            timer: Timer::default(),
         }
     }
 
@@ -485,402 +248,416 @@ impl GuiState {
     }
 }
 
-pub fn run() -> Result<()> {
-    let ui = MainWindow::new().context("Could not create the native GUI window")?;
-    let state = Rc::new(RefCell::new(GuiState::new()));
-
-    refresh_disks(&state);
-    install_callbacks(&ui, &state);
-    install_worker_timer(&ui, &state);
-    update_ui(&ui, &state.borrow());
-
-    ui.run().context("Native GUI event loop failed")
+#[derive(Clone, Debug)]
+enum Message {
+    ChooseImage,
+    RefreshDisks,
+    SelectDisk(DiskChoice),
+    SelectArchiveEntry(String),
+    SelectArchiveMode(ArchiveModeChoice),
+    SelectBlockSize(BlockSizeChoice),
+    SetWriteMode(bool),
+    SetVerifyWrites(bool),
+    SetManualTest(bool),
+    SetConfirmed(bool),
+    RestartAsAdministrator,
+    StartJob,
+    StopJob,
+    Tick,
 }
 
-fn install_callbacks(ui: &MainWindow, state: &Rc<RefCell<GuiState>>) {
-    let weak = ui.as_weak();
-    let state_ref = Rc::clone(state);
-    ui.on_choose_image(move || {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        choose_image(&ui, &state_ref);
-    });
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DiskChoice {
+    number: u32,
+    label: String,
+}
 
-    let weak = ui.as_weak();
-    let state_ref = Rc::clone(state);
-    ui.on_refresh_disks(move || {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        refresh_disks(&state_ref);
-        update_ui(&ui, &state_ref.borrow());
-    });
+impl std::fmt::Display for DiskChoice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.label.fmt(formatter)
+    }
+}
 
-    let weak = ui.as_weak();
-    let state_ref = Rc::clone(state);
-    ui.on_select_disk(move |index| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        let mut state = state_ref.borrow_mut();
-        state.selected_disk = usize::try_from(index)
-            .ok()
-            .and_then(|index| index.checked_sub(1))
-            .filter(|index| *index < state.disks.len());
-        state.confirmed = false;
-        drop(state);
-        update_ui(&ui, &state_ref.borrow());
-    });
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArchiveModeChoice {
+    Auto,
+    RawImage,
+    Archive,
+}
 
-    let weak = ui.as_weak();
-    let state_ref = Rc::clone(state);
-    ui.on_select_entry(move |index| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        if let Some(source) = state_ref.borrow_mut().source.as_mut() {
-            source.selected_entry = usize::try_from(index)
-                .ok()
-                .and_then(|index| source.entries.get(index))
-                .map(|entry| entry.path.clone());
-            source.image_size = source.selected_entry.as_ref().and_then(|selected| {
-                source
-                    .entries
-                    .iter()
-                    .find(|entry| &entry.path == selected)
-                    .map(|entry| entry.size)
-            });
+impl ArchiveModeChoice {
+    const ALL: [Self; 3] = [Self::Auto, Self::RawImage, Self::Archive];
+}
+
+impl From<ArchiveInputMode> for ArchiveModeChoice {
+    fn from(mode: ArchiveInputMode) -> Self {
+        match mode {
+            ArchiveInputMode::Auto => Self::Auto,
+            ArchiveInputMode::No => Self::RawImage,
+            ArchiveInputMode::Yes => Self::Archive,
         }
-        update_ui(&ui, &state_ref.borrow());
-    });
+    }
+}
 
-    let weak = ui.as_weak();
-    let state_ref = Rc::clone(state);
-    ui.on_set_archive_mode(move |index| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        let mode = match index {
-            1 => ArchiveInputMode::No,
-            2 => ArchiveInputMode::Yes,
-            _ => ArchiveInputMode::Auto,
-        };
-        let path = state_ref
-            .borrow()
-            .source
-            .as_ref()
-            .map(|source| source.path.clone());
-        let mut state = state_ref.borrow_mut();
-        state.archive_mode = mode;
-        state.confirmed = false;
-        if let Some(path) = path {
-            match SourceSelection::inspect(path, mode) {
-                Ok(source) => {
-                    state.source = Some(source);
-                    state.notice.clear();
-                    state.notice_error = false;
+impl From<ArchiveModeChoice> for ArchiveInputMode {
+    fn from(mode: ArchiveModeChoice) -> Self {
+        match mode {
+            ArchiveModeChoice::Auto => Self::Auto,
+            ArchiveModeChoice::RawImage => Self::No,
+            ArchiveModeChoice::Archive => Self::Yes,
+        }
+    }
+}
+
+impl std::fmt::Display for ArchiveModeChoice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => "Auto-detect",
+            Self::RawImage => "Raw image",
+            Self::Archive => "Archive",
+        }
+        .fmt(formatter)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockSizeChoice {
+    Small,
+    Balanced,
+    Large,
+}
+
+impl BlockSizeChoice {
+    const ALL: [Self; 3] = [Self::Small, Self::Balanced, Self::Large];
+
+    fn mib(self) -> u64 {
+        match self {
+            Self::Small => 1,
+            Self::Balanced => 4,
+            Self::Large => 16,
+        }
+    }
+}
+
+impl From<u64> for BlockSizeChoice {
+    fn from(mib: u64) -> Self {
+        match mib {
+            1 => Self::Small,
+            16 => Self::Large,
+            _ => Self::Balanced,
+        }
+    }
+}
+
+impl std::fmt::Display for BlockSizeChoice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Small => "1 MiB — smaller writes",
+            Self::Balanced => "4 MiB — balanced",
+            Self::Large => "16 MiB — faster",
+        }
+        .fmt(formatter)
+    }
+}
+
+struct BimSyncApp {
+    state: GuiState,
+}
+
+impl BimSyncApp {
+    fn new() -> Self {
+        let mut state = GuiState::new();
+        refresh_disks(&mut state);
+        Self { state }
+    }
+
+    fn update(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::ChooseImage => choose_image(&mut self.state),
+            Message::RefreshDisks => refresh_disks(&mut self.state),
+            Message::SelectDisk(choice) => {
+                self.state.selected_disk = self
+                    .state
+                    .disks
+                    .iter()
+                    .position(|disk| disk.number == choice.number);
+                self.state.confirmed = false;
+            }
+            Message::SelectArchiveEntry(path) => select_archive_entry(&mut self.state, &path),
+            Message::SelectArchiveMode(mode) => set_archive_mode(&mut self.state, mode.into()),
+            Message::SelectBlockSize(choice) => self.state.block_size_mib = choice.mib(),
+            Message::SetWriteMode(value) => {
+                self.state.write_mode = value;
+                self.state.confirmed = false;
+            }
+            Message::SetVerifyWrites(value) => self.state.verify_writes = value,
+            Message::SetManualTest(value) => {
+                self.state.manual_test = value;
+                self.state.confirmed = false;
+            }
+            Message::SetConfirmed(value) => self.state.confirmed = value,
+            Message::RestartAsAdministrator => match restart_as_administrator() {
+                Ok(()) => {
+                    self.state.notice =
+                        "An elevated BIM Sync window is opening. Close this window.".to_owned();
+                    self.state.notice_error = false;
                 }
                 Err(error) => {
-                    state.source = None;
-                    state.notice = error.to_string();
-                    state.notice_error = true;
+                    self.state.notice = error.to_string();
+                    self.state.notice_error = true;
                 }
-            }
+            },
+            Message::StartJob => launch_job(&mut self.state),
+            Message::StopJob => stop_job(&mut self.state),
+            Message::Tick => poll_worker(&mut self.state),
         }
-        drop(state);
-        update_ui(&ui, &state_ref.borrow());
-    });
+        Task::none()
+    }
 
-    let weak = ui.as_weak();
-    let state_ref = Rc::clone(state);
-    ui.on_set_block_size(move |index| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        state_ref.borrow_mut().block_size_mib = match index {
-            0 => 1,
-            2 => 16,
-            _ => 4,
-        };
-        update_ui(&ui, &state_ref.borrow());
-    });
-
-    bind_checkbox_callbacks(ui, state);
-
-    let weak = ui.as_weak();
-    let state_ref = Rc::clone(state);
-    ui.on_prepare_target(move || {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        launch_prepare(&ui, &state_ref);
-    });
-
-    let weak = ui.as_weak();
-    let state_ref = Rc::clone(state);
-    ui.on_restore_target(move || {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        launch_restore(&ui, &state_ref);
-    });
-
-    let weak = ui.as_weak();
-    let state_ref = Rc::clone(state);
-    ui.on_restart_as_admin(move || {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        restart_as_administrator(&ui, &state_ref);
-    });
-
-    let weak = ui.as_weak();
-    let state_ref = Rc::clone(state);
-    ui.on_start_job(move || {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        launch_job(&ui, &state_ref);
-    });
-
-    let weak = ui.as_weak();
-    let state_ref = Rc::clone(state);
-    ui.on_stop_job(move || {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        if let Some(cancel) = state_ref.borrow().cancel.as_ref() {
-            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-            let mut state = state_ref.borrow_mut();
-            state.notice = "Stopping after the current block. The target may be partially updated; rerun sync to repair it.".to_owned();
-            state.notice_error = true;
-            drop(state);
-            update_ui(&ui, &state_ref.borrow());
+    fn subscription(&self) -> Subscription<Message> {
+        if self.state.receiver.is_some() {
+            time::every(Duration::from_millis(100)).map(|_| Message::Tick)
+        } else {
+            Subscription::none()
         }
-    });
-}
+    }
 
-fn bind_checkbox_callbacks(ui: &MainWindow, state: &Rc<RefCell<GuiState>>) {
-    let weak = ui.as_weak();
-    let state_ref = Rc::clone(state);
-    ui.on_set_write_mode(move |checked| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        let mut state = state_ref.borrow_mut();
-        state.write_mode = checked;
-        state.confirmed = false;
-        drop(state);
-        update_ui(&ui, &state_ref.borrow());
-    });
-
-    let weak = ui.as_weak();
-    let state_ref = Rc::clone(state);
-    ui.on_set_verify_writes(move |checked| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        state_ref.borrow_mut().verify_writes = checked;
-        update_ui(&ui, &state_ref.borrow());
-    });
-
-    let weak = ui.as_weak();
-    let state_ref = Rc::clone(state);
-    ui.on_set_manual_test(move |checked| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        let mut state = state_ref.borrow_mut();
-        state.manual_test = checked;
-        state.confirmed = false;
-        drop(state);
-        update_ui(&ui, &state_ref.borrow());
-    });
-
-    let weak = ui.as_weak();
-    let state_ref = Rc::clone(state);
-    ui.on_set_confirmed(move |checked| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        state_ref.borrow_mut().confirmed = checked;
-        update_ui(&ui, &state_ref.borrow());
-    });
-}
-
-fn install_worker_timer(ui: &MainWindow, state: &Rc<RefCell<GuiState>>) {
-    let weak = ui.as_weak();
-    let state_ref = Rc::clone(state);
-    state
-        .borrow()
-        .timer
-        .start(TimerMode::Repeated, Duration::from_millis(100), move || {
-            if let Some(ui) = weak.upgrade() {
-                poll_worker(&ui, &state_ref);
-            }
+    fn view(&self) -> Element<'_, Message> {
+        let disk_choices: Vec<_> = self
+            .state
+            .disks
+            .iter()
+            .map(|disk| DiskChoice {
+                number: disk.number,
+                label: disk.label(),
+            })
+            .collect();
+        let selected_disk = self.state.selected_disk().map(|disk| DiskChoice {
+            number: disk.number,
+            label: disk.label(),
         });
-}
-
-fn choose_image(ui: &MainWindow, state: &Rc<RefCell<GuiState>>) {
-    let path = rfd::FileDialog::new()
-        .add_filter(
-            "Images and archives",
-            &[
-                "img", "raw", "bin", "iso", "wic", "zip", "7z", "tar", "gz", "tgz", "xz", "txz",
-            ],
-        )
-        .pick_file();
-    let Some(path) = path else {
-        return;
-    };
-
-    let mode = state.borrow().archive_mode;
-    let result = SourceSelection::inspect(path, mode);
-    let mut app = state.borrow_mut();
-    app.confirmed = false;
-    match result {
-        Ok(source) => {
-            app.source = Some(source);
-            app.notice.clear();
-            app.notice_error = false;
-        }
-        Err(error) => {
-            app.source = None;
-            app.notice = error.to_string();
-            app.notice_error = true;
-        }
-    }
-    drop(app);
-    update_ui(ui, &state.borrow());
-}
-
-fn refresh_disks(state: &Rc<RefCell<GuiState>>) {
-    match discover_disks() {
-        Ok(disks) => {
-            let mut state = state.borrow_mut();
-            let selected_number = state.selected_disk().map(|disk| disk.number);
-            state.disks = disks;
-            state.selected_disk = selected_number
-                .and_then(|number| state.disks.iter().position(|disk| disk.number == number));
-            state.notice.clear();
-            state.notice_error = false;
-        }
-        Err(error) => {
-            let mut state = state.borrow_mut();
-            state.notice = format!("Could not discover physical disks: {error}");
-            state.notice_error = true;
-        }
-    }
-}
-
-fn update_ui(ui: &MainWindow, state: &GuiState) {
-    let disk_options = std::iter::once("Select a target disk…".to_owned())
-        .chain(state.disks.iter().map(DiskInfo::label))
-        .collect();
-    ui.set_disk_options(string_model(disk_options));
-    ui.set_selected_disk_index(
-        state
-            .selected_disk
-            .and_then(|index| i32::try_from(index + 1).ok())
-            .unwrap_or(0),
-    );
-    ui.set_disk_details(
-        state
+        let disk_details = self
+            .state
             .selected_disk()
             .map(DiskInfo::details)
-            .unwrap_or_else(|| "No physical disk selected. Disks marked Recommended are removable USB, SD, or MMC media, but you must choose one deliberately.".to_owned())
-            .into(),
-    );
+            .unwrap_or_else(|| "No physical disk selected. Recommended disks are removable USB, SD, or MMC media; choose one deliberately.".to_owned());
 
-    let (path, details, entries, selected_entry) = state
-        .source
-        .as_ref()
-        .map(|source| {
-            (
-                source.path.to_string_lossy().into_owned(),
-                source.description(),
-                source
-                    .entries
-                    .iter()
-                    .map(|entry| format!("{} ({})", entry.path, format_bytes(entry.size)))
-                    .collect(),
-                source.selected_entry.as_ref().and_then(|selected| {
+        let (image_path, image_details, archive_entries, selected_entry) = self
+            .state
+            .source
+            .as_ref()
+            .map(|source| {
+                (
+                    source.path.to_string_lossy().into_owned(),
+                    source.description(),
                     source
                         .entries
                         .iter()
-                        .position(|entry| &entry.path == selected)
-                }),
-            )
-        })
-        .unwrap_or_else(|| {
-            (
-                String::new(),
-                "Choose a raw image or supported archive.".to_owned(),
-                Vec::new(),
-                None,
-            )
-        });
-    ui.set_image_path(path.into());
-    ui.set_image_details(details.into());
-    ui.set_has_entry_choice(entries.len() > 1);
-    ui.set_archive_entries(string_model(entries));
-    ui.set_selected_entry_index(
-        selected_entry
-            .and_then(|index| i32::try_from(index).ok())
-            .unwrap_or(0),
-    );
-    ui.set_archive_mode_index(match state.archive_mode {
-        ArchiveInputMode::Auto => 0,
-        ArchiveInputMode::No => 1,
-        ArchiveInputMode::Yes => 2,
-    });
-    ui.set_block_size_index(match state.block_size_mib {
-        1 => 0,
-        16 => 2,
-        _ => 1,
-    });
-    ui.set_write_mode(state.write_mode);
-    ui.set_verify_writes(state.verify_writes);
-    ui.set_manual_test(state.manual_test);
-    ui.set_confirmed(state.confirmed);
-    ui.set_running(state.running);
-    ui.set_is_admin(state.is_admin);
-    ui.set_progress(state.progress);
-    ui.set_progress_details(state.progress_details.clone().into());
-    ui.set_notice(state.notice.clone().into());
-    ui.set_notice_error(state.notice_error);
+                        .map(|entry| format!("{} ({})", entry.path, format_bytes(entry.size)))
+                        .collect::<Vec<_>>(),
+                    source.selected_entry.as_ref().and_then(|selected| {
+                        source
+                            .entries
+                            .iter()
+                            .find(|entry| &entry.path == selected)
+                            .map(|entry| format!("{} ({})", entry.path, format_bytes(entry.size)))
+                    }),
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    "No image selected".to_owned(),
+                    "Choose a raw image or supported archive.".to_owned(),
+                    Vec::new(),
+                    None,
+                )
+            });
 
-    let readiness = readiness(state);
-    ui.set_preflight(readiness.message.into());
-    ui.set_preflight_error(readiness.blocking);
-    ui.set_can_start(!state.running && readiness.can_start);
-    ui.set_can_stop(state.running && !state.manual_test && state.cancel.is_some());
-    ui.set_can_prepare(!state.running && state.is_admin && readiness.can_prepare);
-    ui.set_can_restore(
-        !state.running
-            && state.is_admin
-            && state
-                .selected_disk()
-                .is_some_and(|disk| !disk.is_removable() && disk.is_offline),
-    );
-    ui.set_action_label(
-        if state.manual_test {
+        let mut image_button = button("Choose image…");
+        if !self.state.running {
+            image_button = image_button.on_press(Message::ChooseImage);
+        }
+        let archive_entry_control: Element<'_, Message> = if archive_entries.len() > 1 {
+            column![
+                text("Archive entry"),
+                pick_list(archive_entries, selected_entry, Message::SelectArchiveEntry)
+                    .width(Length::Fill)
+            ]
+            .spacing(4)
+            .into()
+        } else {
+            container(text("")).into()
+        };
+
+        let image_section = section(
+            "1. Image",
+            column![
+                row![
+                    container(text(image_path).wrapping(text::Wrapping::Word)).width(Length::Fill),
+                    image_button
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+                text(image_details).size(14),
+                row![
+                    text("Input type"),
+                    pick_list(
+                        ArchiveModeChoice::ALL.to_vec(),
+                        Some(ArchiveModeChoice::from(self.state.archive_mode)),
+                        Message::SelectArchiveMode
+                    )
+                    .width(220)
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+                archive_entry_control,
+            ]
+            .spacing(7),
+        );
+
+        let mut refresh_button = button("Refresh");
+        if !self.state.running {
+            refresh_button = refresh_button.on_press(Message::RefreshDisks);
+        }
+        let target_section = section(
+            "2. Target disk",
+            column![
+                row![
+                    pick_list(disk_choices, selected_disk, Message::SelectDisk)
+                        .placeholder("Select a target disk")
+                        .width(Length::Fill),
+                    refresh_button
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+                text(disk_details).size(14),
+            ]
+            .spacing(7),
+        );
+
+        let operation_section = section(
+            "3. Operation",
+            column![
+                checkbox(self.state.write_mode)
+                    .label("Write changed blocks (otherwise compare only)")
+                    .on_toggle(Message::SetWriteMode),
+                checkbox(self.state.verify_writes)
+                    .label("Verify every block after writing (recommended)")
+                    .on_toggle(Message::SetVerifyWrites),
+                checkbox(self.state.manual_test)
+                    .label("Run destructive two-block diagnostic on a disposable removable card")
+                    .on_toggle(Message::SetManualTest),
+                checkbox(self.state.confirmed)
+                    .label("I have verified the selected target disk")
+                    .on_toggle(Message::SetConfirmed),
+                row![
+                    text("Block size"),
+                    pick_list(
+                        BlockSizeChoice::ALL.to_vec(),
+                        Some(BlockSizeChoice::from(self.state.block_size_mib)),
+                        Message::SelectBlockSize
+                    )
+                    .width(240),
+                    administrator_status(self.state.is_admin)
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+            ]
+            .spacing(7),
+        );
+
+        let readiness = readiness(&self.state);
+        let readiness_prefix = if readiness.blocking {
+            "Action required: "
+        } else {
+            ""
+        };
+        let readiness_section = section(
+            "Readiness",
+            text(format!("{readiness_prefix}{}", readiness.message)).size(14),
+        );
+
+        let action_label = if self.state.manual_test {
             "Run destructive diagnostic"
-        } else if state.write_mode {
+        } else if self.state.write_mode {
             "Sync changed blocks"
         } else {
             "Compare selected disk"
+        };
+        let mut start_button = button(action_label);
+        if !self.state.running && readiness.can_start {
+            start_button = start_button.on_press(Message::StartJob);
         }
-        .into(),
-    );
+        let mut stop_button = button("Stop safely");
+        if self.state.running && !self.state.manual_test && self.state.cancel.is_some() {
+            stop_button = stop_button.on_press(Message::StopJob);
+        }
+        let progress_section = section(
+            "Progress",
+            column![
+                progress_bar(0.0..=1.0, self.state.progress).girth(8),
+                text(&self.state.progress_details).size(14),
+                row![start_button, stop_button].spacing(10),
+            ]
+            .spacing(7),
+        );
+
+        let notice: Element<'_, Message> = if self.state.notice.is_empty() {
+            container(text("")).into()
+        } else {
+            let prefix = if self.state.notice_error {
+                "Error: "
+            } else {
+                ""
+            };
+            container(text(format!("{prefix}{}", self.state.notice)).size(14))
+                .padding([4, 0])
+                .into()
+        };
+
+        let content = column![
+            text("BIM Sync").size(32),
+            text("Incrementally compare and sync raw disk images without rewriting unchanged blocks.")
+                .size(15),
+            image_section,
+            target_section,
+            operation_section,
+            readiness_section,
+            progress_section,
+            notice,
+        ]
+        .spacing(14)
+        .padding(14)
+        .width(Length::Fill);
+
+        scrollable(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+}
+
+fn administrator_status(is_admin: bool) -> Element<'static, Message> {
+    if is_admin {
+        text("Administrator: ready").size(14).into()
+    } else {
+        button("Restart as administrator")
+            .on_press(Message::RestartAsAdministrator)
+            .into()
+    }
+}
+
+fn section<'a>(title: &'a str, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    container(column![text(title).size(18), body.into()].spacing(6))
+        .padding(10)
+        .width(Length::Fill)
+        .into()
 }
 
 struct Readiness {
     message: String,
     blocking: bool,
     can_start: bool,
-    can_prepare: bool,
 }
 
 fn readiness(state: &GuiState) -> Readiness {
@@ -889,7 +666,6 @@ fn readiness(state: &GuiState) -> Readiness {
             message: "Choose a physical target disk. The GUI intentionally never selects one automatically.".to_owned(),
             blocking: true,
             can_start: false,
-            can_prepare: false,
         };
     };
     if !state.is_admin {
@@ -897,7 +673,6 @@ fn readiness(state: &GuiState) -> Readiness {
             message: "Administrator rights are required to inspect and access raw physical disks. Restart the GUI as administrator.".to_owned(),
             blocking: true,
             can_start: false,
-            can_prepare: false,
         };
     }
     if disk.is_boot || disk.is_system {
@@ -906,7 +681,6 @@ fn readiness(state: &GuiState) -> Readiness {
                 .to_owned(),
             blocking: true,
             can_start: false,
-            can_prepare: false,
         };
     }
     if state.manual_test && !disk.is_removable() {
@@ -915,7 +689,6 @@ fn readiness(state: &GuiState) -> Readiness {
                 .to_owned(),
             blocking: true,
             can_start: false,
-            can_prepare: false,
         };
     }
     if !state.manual_test {
@@ -924,7 +697,6 @@ fn readiness(state: &GuiState) -> Readiness {
                 message: "Choose the image to compare or sync.".to_owned(),
                 blocking: true,
                 can_start: false,
-                can_prepare: false,
             };
         };
         if source.kind.is_some()
@@ -935,7 +707,6 @@ fn readiness(state: &GuiState) -> Readiness {
                 message: "Choose the image entry inside the archive.".to_owned(),
                 blocking: true,
                 can_start: false,
-                can_prepare: false,
             };
         }
         if source.image_size.is_some_and(|size| size > disk.size) {
@@ -948,15 +719,13 @@ fn readiness(state: &GuiState) -> Readiness {
                 ),
                 blocking: true,
                 can_start: false,
-                can_prepare: false,
             };
         }
         if image_is_on_target(source, disk) {
             return Readiness {
-                message: "The image file is stored on the selected target disk. Choose another source location before dismounting or writing the target.".to_owned(),
+                message: "The image file is stored on the selected target disk. Choose another source location before writing the target.".to_owned(),
                 blocking: true,
                 can_start: false,
-                can_prepare: false,
             };
         }
     }
@@ -967,33 +736,23 @@ fn readiness(state: &GuiState) -> Readiness {
                     .to_owned(),
             blocking: true,
             can_start: false,
-            can_prepare: !disk.is_boot && !disk.is_system,
         };
     }
     if state.write_mode || state.manual_test {
         if disk.is_read_only {
             return Readiness {
-                message: "The selected disk is read-only. Use Prepare target to clear the read-only state.".to_owned(),
+                message: "The selected disk is read-only. Clear the read-only state in Windows before writing."
+                    .to_owned(),
                 blocking: true,
                 can_start: false,
-                can_prepare: true,
             };
         }
         if disk.is_removable() && disk.has_offline_partition {
             return Readiness {
-                message: "A target partition is offline, likely left by an older preparation attempt. Use Prepare target to bring it back online; BIM Sync will lock and dismount it only while writing.".to_owned(),
-                blocking: true,
-                can_start: false,
-                can_prepare: true,
-            };
-        }
-        if !disk.is_removable() && !disk.is_offline {
-            return Readiness {
-                message: "Take this fixed disk offline before writing. Use Prepare target."
+                message: "A target partition is offline, likely left by an older BIM Sync version. Bring it online in Disk Management or reinsert the card before writing."
                     .to_owned(),
                 blocking: true,
                 can_start: false,
-                can_prepare: true,
             };
         }
     }
@@ -1004,7 +763,7 @@ fn readiness(state: &GuiState) -> Readiness {
         )
     } else if state.write_mode {
         format!(
-            "Ready to incrementally sync the image to Disk {} with {} verification. Mounted target volumes will be exclusively locked only while BIM Sync is writing.",
+            "Ready to incrementally sync the image to Disk {} with {} verification. Mounted target volumes are locked only while BIM Sync writes.",
             disk.number,
             if state.verify_writes {
                 "read-after-write"
@@ -1022,7 +781,6 @@ fn readiness(state: &GuiState) -> Readiness {
         message,
         blocking: false,
         can_start: true,
-        can_prepare: false,
     }
 }
 
@@ -1045,89 +803,139 @@ fn display_mount_point(mount_point: &str) -> String {
     mount_point.trim_end_matches(['\\', '/']).to_owned()
 }
 
-fn launch_prepare(ui: &MainWindow, state: &Rc<RefCell<GuiState>>) {
-    let Some(disk) = state.borrow().selected_disk().cloned() else {
-        return;
-    };
-    let (sender, receiver) = mpsc::channel();
-    {
-        let mut state = state.borrow_mut();
-        state.running = true;
-        state.receiver = Some(receiver);
-        state.notice = format!("Preparing Disk {}…", disk.number);
-        state.notice_error = false;
-    }
-    thread::spawn(move || {
-        let result = prepare_disk(&disk).map_err(|error| error.to_string());
-        let _ = sender.send(WorkerEvent::Prepared(result));
-    });
-    update_ui(ui, &state.borrow());
+pub fn run() -> Result<()> {
+    iced::application(BimSyncApp::new, BimSyncApp::update, BimSyncApp::view)
+        .title("BIM Sync")
+        .theme(app_theme)
+        .subscription(BimSyncApp::subscription)
+        .window_size((900.0, 760.0))
+        .run()
+        .context("Native GUI event loop failed")
 }
 
-fn launch_restore(ui: &MainWindow, state: &Rc<RefCell<GuiState>>) {
-    let Some(disk) = state.borrow().selected_disk().cloned() else {
-        return;
-    };
-    let (sender, receiver) = mpsc::channel();
-    {
-        let mut state = state.borrow_mut();
-        state.running = true;
-        state.receiver = Some(receiver);
-        state.notice = format!("Bringing Disk {} online…", disk.number);
-        state.notice_error = false;
-    }
-    thread::spawn(move || {
-        let result = restore_disk(&disk).map_err(|error| error.to_string());
-        let _ = sender.send(WorkerEvent::Restored(result));
-    });
-    update_ui(ui, &state.borrow());
+fn app_theme(_: &BimSyncApp) -> Theme {
+    Theme::Dark
 }
 
-fn launch_job(ui: &MainWindow, state: &Rc<RefCell<GuiState>>) {
-    let check = readiness(&state.borrow());
+fn choose_image(state: &mut GuiState) {
+    let path = rfd::FileDialog::new()
+        .add_filter(
+            "Images and archives",
+            &[
+                "img", "raw", "bin", "iso", "wic", "zip", "7z", "tar", "gz", "tgz", "xz", "txz",
+            ],
+        )
+        .pick_file();
+    let Some(path) = path else {
+        return;
+    };
+
+    state.confirmed = false;
+    match SourceSelection::inspect(path, state.archive_mode) {
+        Ok(source) => {
+            state.source = Some(source);
+            state.notice.clear();
+            state.notice_error = false;
+        }
+        Err(error) => {
+            state.source = None;
+            state.notice = error.to_string();
+            state.notice_error = true;
+        }
+    }
+}
+
+fn refresh_disks(state: &mut GuiState) {
+    match discover_disks() {
+        Ok(disks) => {
+            let selected_number = state.selected_disk().map(|disk| disk.number);
+            state.disks = disks;
+            state.selected_disk = selected_number
+                .and_then(|number| state.disks.iter().position(|disk| disk.number == number));
+            state.notice.clear();
+            state.notice_error = false;
+        }
+        Err(error) => {
+            state.notice = format!("Could not discover physical disks: {error}");
+            state.notice_error = true;
+        }
+    }
+}
+
+fn select_archive_entry(state: &mut GuiState, selected: &str) {
+    let Some(source) = state.source.as_mut() else {
+        return;
+    };
+    let selected = source.entries.iter().find_map(|entry| {
+        (format!("{} ({})", entry.path, format_bytes(entry.size)) == selected)
+            .then(|| entry.path.clone())
+    });
+    source.selected_entry = selected;
+    source.image_size = source.selected_entry.as_ref().and_then(|selected| {
+        source
+            .entries
+            .iter()
+            .find(|entry| &entry.path == selected)
+            .map(|entry| entry.size)
+    });
+}
+
+fn set_archive_mode(state: &mut GuiState, mode: ArchiveInputMode) {
+    let path = state.source.as_ref().map(|source| source.path.clone());
+    state.archive_mode = mode;
+    state.confirmed = false;
+    let Some(path) = path else {
+        return;
+    };
+    match SourceSelection::inspect(path, mode) {
+        Ok(source) => {
+            state.source = Some(source);
+            state.notice.clear();
+            state.notice_error = false;
+        }
+        Err(error) => {
+            state.source = None;
+            state.notice = error.to_string();
+            state.notice_error = true;
+        }
+    }
+}
+
+fn launch_job(state: &mut GuiState) {
+    let check = readiness(state);
     if !check.can_start {
-        let mut app = state.borrow_mut();
-        app.notice = check.message;
-        app.notice_error = true;
-        drop(app);
-        update_ui(ui, &state.borrow());
+        state.notice = check.message;
+        state.notice_error = true;
         return;
     }
 
     let disk = state
-        .borrow()
         .selected_disk()
         .cloned()
         .expect("readiness requires a selected disk");
     let (sender, receiver) = mpsc::channel();
-    let mut state_mut = state.borrow_mut();
-    state_mut.running = true;
-    state_mut.receiver = Some(receiver);
-    state_mut.started = Some(Instant::now());
-    state_mut.progress = 0.0;
-    state_mut.progress_total = None;
-    state_mut.progress_details = "Starting…".to_owned();
-    state_mut.notice.clear();
-    state_mut.notice_error = false;
+    state.running = true;
+    state.receiver = Some(receiver);
+    state.started = Some(Instant::now());
+    state.progress = 0.0;
+    state.progress_total = None;
+    state.progress_details = "Starting…".to_owned();
+    state.notice.clear();
+    state.notice_error = false;
 
-    if state_mut.manual_test {
-        state_mut.cancel = None;
-        let block_size = block_size_bytes(state_mut.block_size_mib).expect("validated block size");
-        drop(state_mut);
+    if state.manual_test {
+        state.cancel = None;
+        let block_size = block_size_bytes(state.block_size_mib).expect("validated block size");
         thread::spawn(move || run_manual_job(disk, block_size, sender));
     } else {
-        let source = state_mut
-            .source
-            .clone()
-            .expect("readiness requires a source");
+        let source = state.source.clone().expect("readiness requires a source");
         let cancel = Arc::new(AtomicBool::new(false));
-        state_mut.cancel = Some(Arc::clone(&cancel));
+        state.cancel = Some(Arc::clone(&cancel));
         let options = SyncOptions {
-            block_size: block_size_bytes(state_mut.block_size_mib).expect("validated block size"),
-            verify_only: !state_mut.write_mode,
-            verify_writes: state_mut.verify_writes,
+            block_size: block_size_bytes(state.block_size_mib).expect("validated block size"),
+            verify_only: !state.write_mode,
+            verify_writes: state.verify_writes,
         };
-        drop(state_mut);
         thread::spawn(move || {
             run_sync_job(
                 GuiSyncRequest {
@@ -1140,62 +948,36 @@ fn launch_job(ui: &MainWindow, state: &Rc<RefCell<GuiState>>) {
             )
         });
     }
-    update_ui(ui, &state.borrow());
 }
 
-fn poll_worker(ui: &MainWindow, state: &Rc<RefCell<GuiState>>) {
+fn stop_job(state: &mut GuiState) {
+    let Some(cancel) = state.cancel.as_ref() else {
+        return;
+    };
+    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    state.notice = "Stopping after the current block. The target may be partially updated; rerun sync to repair it.".to_owned();
+    state.notice_error = true;
+}
+
+fn poll_worker(state: &mut GuiState) {
     let events: Vec<_> = state
-        .borrow()
         .receiver
         .as_ref()
         .map(|receiver| receiver.try_iter().collect())
         .unwrap_or_default();
-    if events.is_empty() {
-        return;
-    }
     for event in events {
         handle_worker_event(state, event);
     }
-    update_ui(ui, &state.borrow());
 }
 
-fn handle_worker_event(state: &Rc<RefCell<GuiState>>, event: WorkerEvent) {
-    let mut state = state.borrow_mut();
+fn handle_worker_event(state: &mut GuiState, event: WorkerEvent) {
     match event {
         WorkerEvent::Started { total, label } => {
             state.progress_total = total;
             state.progress_details = format!("{label}\nWaiting for the first block…");
         }
-        WorkerEvent::Sync(event) => handle_sync_event(&mut state, event),
-        WorkerEvent::Manual(event) => handle_manual_event(&mut state, event),
-        WorkerEvent::Prepared(result) => {
-            state.running = false;
-            state.receiver = None;
-            match result {
-                Ok(message) => {
-                    state.notice = message;
-                    state.notice_error = false;
-                }
-                Err(error) => {
-                    state.notice = error;
-                    state.notice_error = true;
-                }
-            }
-        }
-        WorkerEvent::Restored(result) => {
-            state.running = false;
-            state.receiver = None;
-            match result {
-                Ok(message) => {
-                    state.notice = message;
-                    state.notice_error = false;
-                }
-                Err(error) => {
-                    state.notice = error;
-                    state.notice_error = true;
-                }
-            }
-        }
+        WorkerEvent::Sync(event) => handle_sync_event(state, event),
+        WorkerEvent::Manual(event) => handle_manual_event(state, event),
         WorkerEvent::Finished(result) => {
             state.running = false;
             state.cancel = None;
@@ -1207,7 +989,7 @@ fn handle_worker_event(state: &Rc<RefCell<GuiState>>, event: WorkerEvent) {
                     state.notice_error = false;
                     state.progress_details = format!(
                         "Completed in {}\n{}",
-                        elapsed(&state),
+                        elapsed(state),
                         sync_summary_text(summary)
                     );
                 }
@@ -1219,7 +1001,7 @@ fn handle_worker_event(state: &Rc<RefCell<GuiState>>, event: WorkerEvent) {
                     );
                     state.notice_error = false;
                     state.progress_details =
-                        format!("Completed in {}\n{}", elapsed(&state), state.notice);
+                        format!("Completed in {}\n{}", elapsed(state), state.notice);
                 }
                 Err(error) => {
                     let stopped = error.contains("Operation stopped by the user");
@@ -1229,7 +1011,7 @@ fn handle_worker_event(state: &Rc<RefCell<GuiState>>, event: WorkerEvent) {
                         format!("Operation failed: {error}")
                     };
                     state.notice_error = true;
-                    state.progress_details = format!("{}\n{}", elapsed(&state), state.notice);
+                    state.progress_details = format!("{}\n{}", elapsed(state), state.notice);
                 }
             }
         }
@@ -1710,46 +1492,6 @@ fn json_string(record: &serde_json::Map<String, Value>, key: &str) -> String {
         .to_owned()
 }
 
-fn prepare_disk(disk: &DiskInfo) -> Result<String> {
-    if disk.is_boot || disk.is_system {
-        bail!("Refusing to prepare a Windows boot or system disk")
-    }
-    let script = if disk.is_removable() {
-        format!(
-            "$n = {}; Get-Partition -DiskNumber $n -ErrorAction SilentlyContinue | Where-Object IsOffline | Set-Partition -IsOffline $false -ErrorAction Stop; Set-Disk -Number $n -IsReadOnly $false -ErrorAction Stop",
-            disk.number
-        )
-    } else {
-        format!(
-            "$n = {}; Set-Disk -Number $n -IsOffline $true -ErrorAction Stop; Set-Disk -Number $n -IsReadOnly $false -ErrorAction Stop",
-            disk.number
-        )
-    };
-    run_powershell(&script)?;
-    Ok(if disk.is_removable() {
-        format!("Disk {} prepared: offline partitions were brought online and read-only mode was cleared. BIM Sync will exclusively lock mounted volumes only while writing.", disk.number)
-    } else {
-        format!(
-            "Disk {} prepared: it is offline and writable. Refresh the disk list before writing.",
-            disk.number
-        )
-    })
-}
-
-fn restore_disk(disk: &DiskInfo) -> Result<String> {
-    if disk.is_removable() {
-        bail!("Removable media cannot reliably have old mount points restored. Reinsert the card after writing.")
-    }
-    run_powershell(&format!(
-        "Set-Disk -Number {} -IsOffline $false -ErrorAction Stop",
-        disk.number
-    ))?;
-    Ok(format!(
-        "Disk {} was brought online. Refresh the disk list to confirm its state.",
-        disk.number
-    ))
-}
-
 fn is_administrator() -> bool {
     run_powershell(
         "([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)",
@@ -1758,36 +1500,19 @@ fn is_administrator() -> bool {
     .unwrap_or(false)
 }
 
-fn restart_as_administrator(ui: &MainWindow, state: &Rc<RefCell<GuiState>>) {
-    let result = (|| -> Result<()> {
-        let exe = std::env::current_exe().context("Could not locate bim-sync-gui.exe")?;
-        let escaped = exe.to_string_lossy().replace('\'', "''");
-        Command::new("powershell.exe")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                &format!("Start-Process -FilePath '{escaped}' -Verb RunAs"),
-            ])
-            .spawn()
-            .context("Could not request administrator elevation")?;
-        Ok(())
-    })();
-    let mut app = state.borrow_mut();
-    match result {
-        Ok(()) => {
-            app.notice =
-                "An elevated BIM Sync window is opening. Close this non-administrator window."
-                    .to_owned();
-            app.notice_error = false;
-        }
-        Err(error) => {
-            app.notice = error.to_string();
-            app.notice_error = true;
-        }
-    }
-    drop(app);
-    update_ui(ui, &state.borrow());
+fn restart_as_administrator() -> Result<()> {
+    let exe = std::env::current_exe().context("Could not locate bim-sync-gui.exe")?;
+    let escaped = exe.to_string_lossy().replace('\'', "''");
+    Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!("Start-Process -FilePath '{escaped}' -Verb RunAs"),
+        ])
+        .spawn()
+        .context("Could not request administrator elevation")?;
+    Ok(())
 }
 
 fn run_powershell(script: &str) -> Result<String> {
@@ -1809,15 +1534,6 @@ fn run_powershell(script: &str) -> Result<String> {
         )
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
-fn string_model(values: Vec<String>) -> ModelRc<SharedString> {
-    ModelRc::from(Rc::new(VecModel::from(
-        values
-            .into_iter()
-            .map(SharedString::from)
-            .collect::<Vec<_>>(),
-    )))
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -1922,7 +1638,6 @@ mod tests {
             progress_details: String::new(),
             notice: String::new(),
             notice_error: false,
-            timer: Timer::default(),
         }
     }
 
@@ -1947,8 +1662,7 @@ mod tests {
         let readiness = readiness(&state);
 
         assert!(readiness.can_start);
-        assert!(!readiness.can_prepare);
-        assert!(readiness.message.contains("exclusively locked"));
+        assert!(readiness.message.contains("locked only"));
     }
 
     #[test]
@@ -1962,7 +1676,6 @@ mod tests {
         let readiness = readiness(&state);
 
         assert!(!readiness.can_start);
-        assert!(readiness.can_prepare);
         assert!(readiness.message.contains("offline"));
     }
 

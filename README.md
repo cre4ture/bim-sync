@@ -64,8 +64,9 @@ The executables will be created at:
 
 ## Native GUI
 
-`bim-sync-gui.exe` is a native Windows desktop application. It does not use a
-browser, web server, or web UI. Build and run it with:
+`bim-sync-gui.exe` is a native Windows desktop application built with
+[Iced](https://iced.rs/). It does not use a browser, web server, or web UI.
+Build and run it with:
 
 ```powershell
 cargo run --release --bin bim-sync-gui
