@@ -224,10 +224,10 @@ fn lock_target_volumes(disk_number: u32) -> Result<Vec<VolumeLock>> {
     Ok(locks)
 }
 
-fn open_raw_target_disk(disk_number: u32, disk_path: &str, write: bool) -> Result<RawTargetDisk> {
+fn open_raw_target_disk(_disk_number: u32, disk_path: &str, write: bool) -> Result<RawTargetDisk> {
     #[cfg(windows)]
     let volume_locks = if write {
-        lock_target_volumes(disk_number)?
+        lock_target_volumes(_disk_number)?
     } else {
         Vec::new()
     };
