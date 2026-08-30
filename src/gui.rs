@@ -1206,9 +1206,9 @@ fn handle_worker_event(state: &Rc<RefCell<GuiState>>, event: WorkerEvent) {
             state.running = false;
             state.cancel = None;
             state.receiver = None;
-            state.progress = 1.0;
             match result {
                 Ok(JobResult::Sync(summary)) => {
+                    state.progress = 1.0;
                     state.notice = sync_summary_text(summary);
                     state.notice_error = false;
                     state.progress_details = format!(
@@ -1218,6 +1218,7 @@ fn handle_worker_event(state: &Rc<RefCell<GuiState>>, event: WorkerEvent) {
                     );
                 }
                 Ok(JobResult::Manual(summary)) => {
+                    state.progress = 1.0;
                     state.notice = format!(
                         "Destructive diagnostic completed. It modified {} bytes at offset {}, repaired the card, and verified the repaired result.",
                         summary.mutation_length, summary.mutation_offset
@@ -1348,7 +1349,7 @@ fn run_sync_job(request: GuiSyncRequest, sender: mpsc::Sender<WorkerEvent>) {
         let _ = sender.send(WorkerEvent::Sync(event));
     })
     .map(JobResult::Sync)
-    .map_err(|error| error.to_string());
+    .map_err(|error| format_error_chain(&error));
     let _ = sender.send(WorkerEvent::Finished(result));
 }
 
@@ -1383,7 +1384,7 @@ fn run_manual_job(disk: DiskInfo, block_size: u64, sender: mpsc::Sender<WorkerEv
         )
     })()
     .map(JobResult::Manual)
-    .map_err(|error| error.to_string());
+    .map_err(|error| format_error_chain(&error));
     let _ = sender.send(WorkerEvent::Finished(result));
 }
 
@@ -1878,6 +1879,14 @@ fn sync_summary_text(summary: SyncSummary) -> String {
         format_bytes(summary.rewrite_bytes),
         format_bytes(summary.skipped_bytes())
     )
+}
+
+fn format_error_chain(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\nCaused by: ")
 }
 
 #[cfg(test)]
