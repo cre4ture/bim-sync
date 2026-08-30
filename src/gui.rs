@@ -14,6 +14,18 @@ use std::time::{Duration, Instant};
 slint::slint! {
     import { Button, CheckBox, ComboBox, GroupBox, ProgressIndicator, ScrollView, VerticalBox, HorizontalBox } from "std-widgets.slint";
 
+    component CompactButton inherits Button {
+        height: 34px;
+    }
+
+    component CompactComboBox inherits ComboBox {
+        height: 34px;
+    }
+
+    component CompactCheckBox inherits CheckBox {
+        height: 26px;
+    }
+
     export component MainWindow inherits Window {
         title: "BIM Sync";
         preferred-width: 900px;
@@ -68,8 +80,9 @@ slint::slint! {
         ScrollView {
             mouse-drag-pan-enabled: true;
             VerticalBox {
-                padding: 18px;
-                spacing: 10px;
+                padding: 12px;
+                spacing: 7px;
+                alignment: start;
 
             Text {
                 text: "BIM Sync";
@@ -85,25 +98,26 @@ slint::slint! {
             GroupBox {
                 title: "1. Image";
                 VerticalBox {
-                    spacing: 6px;
+                    spacing: 4px;
+                    alignment: start;
                     HorizontalBox {
                         Text {
                             text: root.image-path == "" ? "No image selected" : root.image-path;
                             vertical-alignment: center;
                             overflow: elide;
                         }
-                        Button { text: "Choose image…"; clicked => { root.choose-image(); } }
+                        CompactButton { width: 170px; text: "Choose image…"; clicked => { root.choose-image(); } }
                     }
                     Text { text: root.image-details; color: #5d6673; wrap: word-wrap; }
                     HorizontalBox {
                         Text { text: "Input type"; vertical-alignment: center; }
-                        ComboBox {
+                        CompactComboBox {
                             model: ["Auto-detect", "Treat as raw image", "Treat as archive"];
                             current-index <=> root.archive-mode-index;
                             selected(value) => { root.set-archive-mode(self.current-index); }
                         }
                         Text { text: "Archive entry"; visible: root.has-entry-choice; vertical-alignment: center; }
-                        ComboBox {
+                        CompactComboBox {
                             visible: root.has-entry-choice;
                             model: root.archive-entries;
                             current-index <=> root.selected-entry-index;
@@ -116,17 +130,18 @@ slint::slint! {
             GroupBox {
                 title: "2. Target disk";
                 VerticalBox {
-                    spacing: 6px;
+                    spacing: 4px;
+                    alignment: start;
                     HorizontalBox {
-                        ComboBox {
+                        CompactComboBox {
                             model: root.disk-options;
                             current-index <=> root.selected-disk-index;
                             enabled: !root.running;
                             selected(value) => { root.select-disk(self.current-index); }
                         }
-                        Button { text: "Refresh"; enabled: !root.running; clicked => { root.refresh-disks(); } }
-                        Button { text: "Prepare target"; enabled: root.can-prepare; clicked => { root.prepare-target(); } }
-                        Button { text: "Bring online"; visible: root.can-restore; enabled: !root.running; clicked => { root.restore-target(); } }
+                        CompactButton { width: 100px; text: "Refresh"; enabled: !root.running; clicked => { root.refresh-disks(); } }
+                        CompactButton { width: 130px; text: "Prepare target"; enabled: root.can-prepare; clicked => { root.prepare-target(); } }
+                        CompactButton { width: 120px; text: "Bring online"; visible: root.can-restore; enabled: !root.running; clicked => { root.restore-target(); } }
                     }
                     Text { text: root.disk-details; color: #5d6673; wrap: word-wrap; }
                 }
@@ -135,26 +150,27 @@ slint::slint! {
             GroupBox {
                 title: "3. Operation";
                 VerticalBox {
-                    spacing: 4px;
-                    CheckBox {
+                    spacing: 3px;
+                    alignment: start;
+                    CompactCheckBox {
                         text: "Write changed blocks (otherwise compare only)";
                         checked: root.write-mode;
                         enabled: !root.running && !root.manual-test;
                         toggled => { root.set-write-mode(self.checked); }
                     }
-                    CheckBox {
+                    CompactCheckBox {
                         text: "Verify every block after writing (recommended)";
                         checked: root.verify-writes;
                         enabled: !root.running && root.write-mode && !root.manual-test;
                         toggled => { root.set-verify-writes(self.checked); }
                     }
-                    CheckBox {
+                    CompactCheckBox {
                         text: "Run destructive two-block diagnostic on a disposable removable card";
                         checked: root.manual-test;
                         enabled: !root.running;
                         toggled => { root.set-manual-test(self.checked); }
                     }
-                    CheckBox {
+                    CompactCheckBox {
                         text: root.manual-test ? "I confirm this is a disposable card" : "I have verified the selected target disk";
                         checked: root.confirmed;
                         visible: root.write-mode || root.manual-test;
@@ -163,7 +179,7 @@ slint::slint! {
                     }
                     HorizontalBox {
                         Text { text: "Block size"; vertical-alignment: center; }
-                        ComboBox {
+                        CompactComboBox {
                             model: ["1 MiB — precise", "4 MiB — balanced", "16 MiB — faster"];
                             current-index <=> root.block-size-index;
                             enabled: !root.running;
@@ -174,7 +190,8 @@ slint::slint! {
                             color: root.is-admin ? #287a42 : #b45309;
                             vertical-alignment: center;
                         }
-                        Button {
+                        CompactButton {
+                            width: 200px;
                             text: "Restart as administrator";
                             visible: !root.is-admin;
                             enabled: !root.running;
@@ -196,16 +213,19 @@ slint::slint! {
             GroupBox {
                 title: "Progress";
                 VerticalBox {
-                    spacing: 5px;
-                    ProgressIndicator { progress: root.progress; }
+                    spacing: 4px;
+                    alignment: start;
+                    ProgressIndicator { height: 8px; progress: root.progress; }
                     Text { text: root.progress-details; wrap: word-wrap; color: #374151; }
                     HorizontalBox {
-                        Button {
+                        CompactButton {
+                            width: 190px;
                             text: root.action-label;
                             enabled: root.can-start;
                             clicked => { root.start-job(); }
                         }
-                        Button {
+                        CompactButton {
+                            width: 110px;
                             text: "Stop safely";
                             visible: root.running;
                             enabled: root.can-stop;
@@ -236,7 +256,7 @@ struct DiskInfo {
     is_offline: bool,
     is_read_only: bool,
     operational_status: String,
-    drive_letters: Vec<String>,
+    mount_points: Vec<String>,
 }
 
 impl DiskInfo {
@@ -265,12 +285,12 @@ impl DiskInfo {
     }
 
     fn details(&self) -> String {
-        let letters = if self.drive_letters.is_empty() {
+        let mount_points = if self.mount_points.is_empty() {
             "none".to_owned()
         } else {
-            self.drive_letters
+            self.mount_points
                 .iter()
-                .map(|letter| format!("{letter}:"))
+                .map(|mount_point| display_mount_point(mount_point))
                 .collect::<Vec<_>>()
                 .join(", ")
         };
@@ -279,7 +299,7 @@ impl DiskInfo {
             self.number,
             self.friendly_name,
             format_bytes(self.size),
-            letters,
+            mount_points,
             if self.is_offline { "offline" } else { "online" },
             if self.is_read_only {
                 "read-only"
@@ -958,13 +978,13 @@ fn readiness(state: &GuiState) -> Readiness {
                 can_prepare: true,
             };
         }
-        if disk.is_removable() && !disk.drive_letters.is_empty() {
+        if disk.is_removable() && !disk.mount_points.is_empty() {
             return Readiness {
                 message: format!(
                     "Dismount {} before writing. Use Prepare target to dismount mounted removable-media volumes.",
-                    disk.drive_letters
+                    disk.mount_points
                         .iter()
-                        .map(|letter| format!("{letter}:"))
+                        .map(|mount_point| display_mount_point(mount_point))
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
@@ -1014,9 +1034,21 @@ fn readiness(state: &GuiState) -> Readiness {
 
 fn image_is_on_target(source: &SourceSelection, disk: &DiskInfo) -> bool {
     let source = source.path.to_string_lossy().to_ascii_uppercase();
-    disk.drive_letters
+    disk.mount_points
         .iter()
-        .any(|letter| source.starts_with(&format!("{}:\\", letter.to_ascii_uppercase())))
+        .map(|mount_point| mount_point.replace('/', "\\").to_ascii_uppercase())
+        .map(|mount_point| {
+            if mount_point.ends_with('\\') {
+                mount_point
+            } else {
+                format!("{mount_point}\\")
+            }
+        })
+        .any(|mount_point| source.starts_with(&mount_point))
+}
+
+fn display_mount_point(mount_point: &str) -> String {
+    mount_point.trim_end_matches(['\\', '/']).to_owned()
 }
 
 fn launch_prepare(ui: &MainWindow, state: &Rc<RefCell<GuiState>>) {
@@ -1605,9 +1637,18 @@ fn discover_disks() -> Result<Vec<DiskInfo>> {
     let script = r#"
 $disks = @(Get-Disk | ForEach-Object {
     $disk = $_
-    $letters = @(Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue |
-        Where-Object { $null -ne $_.DriveLetter -and $_.DriveLetter -ne '' } |
-        ForEach-Object { $_.DriveLetter.ToString() })
+    $mountPoints = @(Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            $driveLetter = [char]$_.DriveLetter
+            $mountedPaths = @($_.AccessPaths | Where-Object { [string]$_ -match '^[A-Za-z]:\\' })
+
+            # Windows reports an unassigned DriveLetter as NUL after mountvol /P.
+            # It is not a mount point. Folder mount points remain valid even when
+            # the partition has no drive letter, so retain those access paths.
+            if ($driveLetter -eq [char]0 -and $mountedPaths.Count -eq 0) { return }
+
+            $mountedPaths | ForEach-Object { [string]$_ }
+        })
     [PSCustomObject]@{
         Number = [int]$disk.Number
         FriendlyName = [string]$disk.FriendlyName
@@ -1618,7 +1659,7 @@ $disks = @(Get-Disk | ForEach-Object {
         IsOffline = [bool]$disk.IsOffline
         IsReadOnly = [bool]$disk.IsReadOnly
         OperationalStatus = [string]($disk.OperationalStatus -join ', ')
-        DriveLetters = $letters
+        MountPoints = $mountPoints
     }
 })
 $disks | ConvertTo-Json -Depth 4 -Compress
@@ -1642,8 +1683,8 @@ $disks | ConvertTo-Json -Depth 4 -Compress
             is_offline: json_bool(record, "IsOffline"),
             is_read_only: json_bool(record, "IsReadOnly"),
             operational_status: json_string(record, "OperationalStatus"),
-            drive_letters: record
-                .get("DriveLetters")
+            mount_points: record
+                .get("MountPoints")
                 .and_then(Value::as_array)
                 .map(|items| {
                     items
@@ -1692,7 +1733,7 @@ fn prepare_disk(disk: &DiskInfo) -> Result<String> {
     }
     let script = if disk.is_removable() {
         format!(
-            "$n = {}; Get-Partition -DiskNumber $n -ErrorAction SilentlyContinue | Where-Object {{ $_.DriveLetter }} | ForEach-Object {{ mountvol \"$($_.DriveLetter):\" /P }}; Set-Disk -Number $n -IsReadOnly $false -ErrorAction Stop",
+            "$n = {}; Get-Partition -DiskNumber $n -ErrorAction SilentlyContinue | ForEach-Object {{ $mountPoint = @($_.AccessPaths | Where-Object {{ [string]$_ -match '^[A-Za-z]:\\' }} | Select-Object -First 1); if ($mountPoint) {{ mountvol $mountPoint[0] /P; if ($LASTEXITCODE -ne 0) {{ throw \"Could not dismount $($mountPoint[0])\" }} }} }}; Set-Disk -Number $n -IsReadOnly $false -ErrorAction Stop",
             disk.number
         )
     } else {
@@ -1854,7 +1895,7 @@ mod tests {
             is_offline: false,
             is_read_only: false,
             operational_status: "Online".to_owned(),
-            drive_letters: Vec::new(),
+            mount_points: Vec::new(),
         }
     }
 
@@ -1906,7 +1947,7 @@ mod tests {
     #[test]
     fn writing_to_a_mounted_removable_target_requires_preparation() {
         let mut target = disk();
-        target.drive_letters = vec!["E".to_owned()];
+        target.mount_points = vec![r"E:\".to_owned()];
         let mut state = state_with(target, Some(source(8 * 1024, r"C:\images\card.img")));
         state.write_mode = true;
         state.confirmed = true;
@@ -1946,7 +1987,7 @@ mod tests {
     #[test]
     fn image_on_target_volume_is_blocked() {
         let mut target = disk();
-        target.drive_letters = vec!["E".to_owned()];
+        target.mount_points = vec![r"E:\".to_owned()];
         let state = state_with(target, Some(source(8 * 1024, r"E:\images\card.img")));
 
         let readiness = readiness(&state);
