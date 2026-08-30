@@ -6,7 +6,11 @@ use lzma_rust2::XzReader;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+mod gui;
+pub use gui::run as run_gui;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -168,6 +172,11 @@ enum ManualTestEvent {
 }
 
 fn main() -> Result<()> {
+    let invocation: Vec<_> = std::env::args_os().collect();
+    if invocation.len() == 1 || invocation.get(1).is_some_and(|arg| arg == "--gui") {
+        return gui::run();
+    }
+
     let args = Args::parse();
 
     let disk_path = format!(r"\\.\PhysicalDrive{}", args.disk);
@@ -1359,6 +1368,31 @@ fn sync_image_to_disk_stream_ordered<I, D, F>(
     image_size: Option<u64>,
     options: SyncOptions,
     first_block_write_order: FirstBlockWriteOrder,
+    report: F,
+) -> Result<SyncSummary>
+where
+    I: Read + ?Sized,
+    D: Read + Write + Seek,
+    F: FnMut(SyncEvent),
+{
+    sync_image_to_disk_stream_ordered_cancellable(
+        image,
+        disk,
+        image_size,
+        options,
+        first_block_write_order,
+        None,
+        report,
+    )
+}
+
+fn sync_image_to_disk_stream_ordered_cancellable<I, D, F>(
+    image: &mut I,
+    disk: &mut D,
+    image_size: Option<u64>,
+    options: SyncOptions,
+    first_block_write_order: FirstBlockWriteOrder,
+    cancelled: Option<&AtomicBool>,
     mut report: F,
 ) -> Result<SyncSummary>
 where
@@ -1380,6 +1414,10 @@ where
     let mut deferred_first_block: Option<Vec<u8>> = None;
 
     loop {
+        if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed)) {
+            bail!("Operation stopped by the user");
+        }
+
         let to_read = match image_size {
             Some(image_size) => {
                 if offset >= image_size {
@@ -1427,6 +1465,10 @@ where
             } else if offset == 0 && first_block_write_order == FirstBlockWriteOrder::Last {
                 deferred_first_block = Some(img_buf[..img_read].to_vec());
             } else {
+                if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed)) {
+                    bail!("Operation stopped by the user");
+                }
+
                 write_changed_block(
                     disk,
                     offset,
@@ -1449,6 +1491,10 @@ where
     }
 
     if let Some(first_block) = deferred_first_block {
+        if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed)) {
+            bail!("Operation stopped by the user");
+        }
+
         write_changed_block(disk, 0, &first_block, options.verify_writes, &mut report)?;
     }
 
@@ -1551,6 +1597,41 @@ mod tests {
             .iter()
             .filter(|event| matches!(event, SyncEvent::Diff { .. } | SyncEvent::Wrote { .. }))
             .collect()
+    }
+
+    #[test]
+    fn cancellation_stops_before_the_deferred_first_block_is_written() {
+        let mut image = Cursor::new(vec![1, 2]);
+        let mut disk = Cursor::new(vec![0, 0]);
+        let cancelled = AtomicBool::new(false);
+
+        let err = sync_image_to_disk_stream_ordered_cancellable(
+            &mut image,
+            &mut disk,
+            Some(2),
+            SyncOptions {
+                block_size: 1,
+                verify_only: false,
+                verify_writes: true,
+            },
+            FirstBlockWriteOrder::Last,
+            Some(&cancelled),
+            |event| {
+                if matches!(
+                    event,
+                    SyncEvent::Progress {
+                        checked_bytes: 1,
+                        ..
+                    }
+                ) {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "Operation stopped by the user");
+        assert_eq!(disk.into_inner(), vec![0, 0]);
     }
 
     #[test]

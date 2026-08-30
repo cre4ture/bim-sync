@@ -43,20 +43,66 @@ Always verify the target disk before writing.
 bim-sync/
 |-- Cargo.toml
 `-- src/
-    `-- main.rs
+    |-- main.rs          # CLI and shared sync engine
+    |-- gui.rs           # native desktop application
+    `-- bin/
+        `-- bim-sync-gui.rs
 ```
 
 ## Build
 
 ```powershell
-cargo build --release
+cargo build --release --bins
 ```
 
-The executable will be created at:
+The executables will be created at:
 
 ```text
 .\target\release\bim-sync.exe
+.\target\release\bim-sync-gui.exe
 ```
+
+## Native GUI
+
+`bim-sync-gui.exe` is a native Windows desktop application. It does not use a
+browser, web server, or web UI. Build and run it with:
+
+```powershell
+cargo run --release --bin bim-sync-gui
+```
+
+Or run the release executable directly:
+
+```powershell
+.\target\release\bim-sync-gui.exe
+```
+
+The regular `bim-sync.exe` also opens the GUI when launched with no arguments;
+all existing command-line invocations continue to use the CLI.
+
+Run the GUI as Administrator. It discovers Windows physical disks and clearly
+identifies each disk number, model, capacity, bus type, mounted drive letters,
+and online/read-only state. It never auto-selects a target disk.
+
+The GUI provides the following safeguards and conveniences:
+
+- Highlights removable USB, SD, and MMC media as recommended candidates, while
+  permanently rejecting boot and system disks.
+- Rejects too-small target disks and image files stored on the target itself.
+- Suggests the appropriate preparation for the selected target: dismount
+  mounted removable volumes or take a fixed disk offline.
+- Selects image-like entries from `.zip`, `.7z`, and tar archives, or asks you
+  to choose when the archive is ambiguous.
+- Starts in compare-only mode; syncing and the destructive diagnostic require
+  an explicit confirmation.
+- Shows checked bytes, throughput, ETA when available, exact byte differences,
+  bytes that must be rewritten, and skipped bytes.
+- Allows a sync to stop after the current block. The result is intentionally
+  marked as partially updated so it can be repaired by rerunning the sync.
+
+For fixed disks, use **Bring online** after a successful operation. Removable
+media that were dismounted should be reinserted so Windows can assign drive
+letters again.
 
 ## Find The Correct Disk Number
 
