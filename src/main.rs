@@ -6,7 +6,20 @@ use lzma_rust2::XzReader;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+#[cfg(windows)]
+use std::ffi::c_void;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use std::os::windows::{fs::OpenOptionsExt, process::CommandExt};
+#[cfg(windows)]
+use std::process::Command;
+
+mod gui;
+pub use gui::run as run_gui;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -50,6 +63,195 @@ struct Args {
     /// Run a destructive generated-image test against the target disk
     #[arg(long, conflicts_with_all = ["verify_only", "no_verify_writes"])]
     manual_test: bool,
+}
+
+/// A raw physical-disk handle that retains exclusive volume locks for the
+/// lifetime of a write operation. The locks are deliberately held until this
+/// value is dropped, so Windows cannot remount a target volume halfway through
+/// an image update.
+struct RawTargetDisk {
+    file: File,
+    #[cfg(windows)]
+    _volume_locks: Vec<VolumeLock>,
+}
+
+impl Read for RawTargetDisk {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(buffer)
+    }
+}
+
+impl Write for RawTargetDisk {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.file.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl Seek for RawTargetDisk {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(position)
+    }
+}
+
+#[cfg(windows)]
+struct VolumeLock {
+    file: File,
+}
+
+#[cfg(windows)]
+impl Drop for VolumeLock {
+    fn drop(&mut self) {
+        // Closing the handle also unlocks the volume. Explicitly unlocking
+        // keeps the transition predictable for Windows' volume manager.
+        let _ = volume_control(&self.file, FSCTL_UNLOCK_VOLUME, "unlock volume");
+    }
+}
+
+#[cfg(windows)]
+const FILE_SHARE_READ_WRITE: u32 = 0x0000_0003;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(windows)]
+const FSCTL_LOCK_VOLUME: u32 = 0x0009_0018;
+#[cfg(windows)]
+const FSCTL_UNLOCK_VOLUME: u32 = 0x0009_001c;
+#[cfg(windows)]
+const FSCTL_DISMOUNT_VOLUME: u32 = 0x0009_0020;
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn DeviceIoControl(
+        device: *mut c_void,
+        control_code: u32,
+        input_buffer: *const c_void,
+        input_buffer_size: u32,
+        output_buffer: *mut c_void,
+        output_buffer_size: u32,
+        bytes_returned: *mut u32,
+        overlapped: *mut c_void,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+fn volume_control(volume: &File, control_code: u32, action: &str) -> Result<()> {
+    let mut bytes_returned = 0;
+    let result = unsafe {
+        DeviceIoControl(
+            volume.as_raw_handle(),
+            control_code,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("Could not {action}"));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn volume_paths_for_disk(disk_number: u32) -> Result<Vec<String>> {
+    let script = format!(
+        r#"$ErrorActionPreference = 'Stop'; $disk = Get-Disk -Number {disk_number}; if (-not $disk.IsOffline) {{ Get-Partition -DiskNumber {disk_number} -ErrorAction SilentlyContinue | ForEach-Object {{ $_.AccessPaths | Where-Object {{ [string]$_ -like '\\?\Volume{{*' }} }} | Sort-Object -Unique }}"#
+    );
+    let mut command = Command::new("powershell.exe");
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ])
+        .creation_flags(CREATE_NO_WINDOW);
+    let output = command
+        .output()
+        .context("Could not inspect target volumes before writing")?;
+    if !output.status.success() {
+        bail!(
+            "Could not inspect target volumes before writing: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+#[cfg(windows)]
+fn lock_target_volumes(disk_number: u32) -> Result<Vec<VolumeLock>> {
+    let volume_paths = volume_paths_for_disk(disk_number)?;
+    let mut locks = Vec::with_capacity(volume_paths.len());
+
+    for volume_path in volume_paths {
+        // CreateFile accepts a volume GUID path without its trailing slash.
+        let path = volume_path.trim_end_matches('\\');
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ_WRITE);
+        let file = options.open(path).with_context(|| {
+            format!(
+                "Could not open target volume {volume_path} for exclusive access. Close File Explorer and applications using the target card."
+            )
+        })?;
+        volume_control(
+            &file,
+            FSCTL_LOCK_VOLUME,
+            &format!("lock target volume {volume_path}"),
+        )?;
+        volume_control(
+            &file,
+            FSCTL_DISMOUNT_VOLUME,
+            &format!("dismount target volume {volume_path}"),
+        )?;
+        locks.push(VolumeLock { file });
+    }
+
+    Ok(locks)
+}
+
+fn open_raw_target_disk(disk_number: u32, disk_path: &str, write: bool) -> Result<RawTargetDisk> {
+    #[cfg(windows)]
+    let volume_locks = if write {
+        lock_target_volumes(disk_number)?
+    } else {
+        Vec::new()
+    };
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    if write {
+        options.write(true);
+    }
+    let file = options.open(disk_path).with_context(|| {
+        if write {
+            format!(
+                "Could not open {disk_path} for read/write. Run as Administrator and close applications using the target card."
+            )
+        } else {
+            format!("Could not open {disk_path} for reading")
+        }
+    })?;
+
+    Ok(RawTargetDisk {
+        file,
+        #[cfg(windows)]
+        _volume_locks: volume_locks,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -168,6 +370,11 @@ enum ManualTestEvent {
 }
 
 fn main() -> Result<()> {
+    let invocation: Vec<_> = std::env::args_os().collect();
+    if invocation.len() == 1 || invocation.get(1).is_some_and(|arg| arg == "--gui") {
+        return gui::run();
+    }
+
     let args = Args::parse();
 
     let disk_path = format!(r"\\.\PhysicalDrive{}", args.disk);
@@ -248,23 +455,8 @@ fn print_disk_warning(disk_number: u32) {
     println!();
 }
 
-fn open_target_disk(args: &Args, disk_path: &str) -> Result<File> {
-    if args.verify_only {
-        OpenOptions::new()
-            .read(true)
-            .open(disk_path)
-            .with_context(|| format!("Could not open {} for reading", disk_path))
-    } else {
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(disk_path)
-            .with_context(|| {
-                format!(
-                    "Could not open {disk_path} for read/write. Run as Administrator and make sure the disk is offline, or for removable media, that its volumes are dismounted."
-                )
-            })
-    }
+fn open_target_disk(args: &Args, disk_path: &str) -> Result<RawTargetDisk> {
+    open_raw_target_disk(args.disk, disk_path, !args.verify_only)
 }
 
 fn sync_reader_with_progress<I, D>(
@@ -976,15 +1168,7 @@ fn run_manual_test_mode(disk_number: u32, disk_path: &str, block_size: u64) -> R
     println!("Use only a disposable SD card selected on purpose.");
     println!();
 
-    let mut disk = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(disk_path)
-        .with_context(|| {
-            format!(
-                "Could not open {disk_path} for read/write. Run as Administrator and make sure the disk is offline, or for removable media, that its volumes are dismounted."
-            )
-        })?;
+    let mut disk = open_raw_target_disk(disk_number, disk_path, true)?;
 
     let summary = run_manual_sd_test(
         &mut disk,
@@ -1359,6 +1543,31 @@ fn sync_image_to_disk_stream_ordered<I, D, F>(
     image_size: Option<u64>,
     options: SyncOptions,
     first_block_write_order: FirstBlockWriteOrder,
+    report: F,
+) -> Result<SyncSummary>
+where
+    I: Read + ?Sized,
+    D: Read + Write + Seek,
+    F: FnMut(SyncEvent),
+{
+    sync_image_to_disk_stream_ordered_cancellable(
+        image,
+        disk,
+        image_size,
+        options,
+        first_block_write_order,
+        None,
+        report,
+    )
+}
+
+fn sync_image_to_disk_stream_ordered_cancellable<I, D, F>(
+    image: &mut I,
+    disk: &mut D,
+    image_size: Option<u64>,
+    options: SyncOptions,
+    first_block_write_order: FirstBlockWriteOrder,
+    cancelled: Option<&AtomicBool>,
     mut report: F,
 ) -> Result<SyncSummary>
 where
@@ -1380,6 +1589,10 @@ where
     let mut deferred_first_block: Option<Vec<u8>> = None;
 
     loop {
+        if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed)) {
+            bail!("Operation stopped by the user");
+        }
+
         let to_read = match image_size {
             Some(image_size) => {
                 if offset >= image_size {
@@ -1427,6 +1640,10 @@ where
             } else if offset == 0 && first_block_write_order == FirstBlockWriteOrder::Last {
                 deferred_first_block = Some(img_buf[..img_read].to_vec());
             } else {
+                if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed)) {
+                    bail!("Operation stopped by the user");
+                }
+
                 write_changed_block(
                     disk,
                     offset,
@@ -1449,6 +1666,10 @@ where
     }
 
     if let Some(first_block) = deferred_first_block {
+        if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed)) {
+            bail!("Operation stopped by the user");
+        }
+
         write_changed_block(disk, 0, &first_block, options.verify_writes, &mut report)?;
     }
 
@@ -1551,6 +1772,41 @@ mod tests {
             .iter()
             .filter(|event| matches!(event, SyncEvent::Diff { .. } | SyncEvent::Wrote { .. }))
             .collect()
+    }
+
+    #[test]
+    fn cancellation_stops_before_the_deferred_first_block_is_written() {
+        let mut image = Cursor::new(vec![1, 2]);
+        let mut disk = Cursor::new(vec![0, 0]);
+        let cancelled = AtomicBool::new(false);
+
+        let err = sync_image_to_disk_stream_ordered_cancellable(
+            &mut image,
+            &mut disk,
+            Some(2),
+            SyncOptions {
+                block_size: 1,
+                verify_only: false,
+                verify_writes: true,
+            },
+            FirstBlockWriteOrder::Last,
+            Some(&cancelled),
+            |event| {
+                if matches!(
+                    event,
+                    SyncEvent::Progress {
+                        checked_bytes: 1,
+                        ..
+                    }
+                ) {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "Operation stopped by the user");
+        assert_eq!(disk.into_inner(), vec![0, 0]);
     }
 
     #[test]
