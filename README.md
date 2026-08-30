@@ -35,7 +35,7 @@ Always verify the target disk before writing.
 - Windows
 - Rust toolchain
 - Administrator PowerShell or Administrator terminal
-- Target disk should be offline, or its volumes should be dismounted, before writing
+- Close File Explorer windows and applications using the target card before writing
 
 ## Project Layout
 
@@ -89,8 +89,8 @@ The GUI provides the following safeguards and conveniences:
 - Highlights removable USB, SD, and MMC media as recommended candidates, while
   permanently rejecting boot and system disks.
 - Rejects too-small target disks and image files stored on the target itself.
-- Suggests the appropriate preparation for the selected target: dismount
-  mounted removable volumes or take a fixed disk offline.
+- Locks and dismounts mounted target volumes only for the lifetime of a write,
+  while suggesting preparation for read-only media and fixed disks.
 - Selects image-like entries from `.zip`, `.7z`, and tar archives, or asks you
   to choose when the archive is ambiguous.
 - Starts in compare-only mode; syncing and the destructive diagnostic require
@@ -101,8 +101,7 @@ The GUI provides the following safeguards and conveniences:
   marked as partially updated so it can be repaired by rerunning the sync.
 
 For fixed disks, use **Bring online** after a successful operation. Removable
-media that were dismounted should be reinserted so Windows can assign drive
-letters again.
+media is automatically unlocked when the operation ends.
 
 ## Find The Correct Disk Number
 
@@ -149,27 +148,11 @@ Set-Disk -Number 1 -IsReadOnly $false
 
 Replace `1` with the correct disk number.
 
-Some removable media, including many SD cards and USB card readers, cannot be
-taken offline with `Set-Disk`. Windows reports:
-
-```text
-Removable media cannot be set to offline.
-```
-
-For removable media, close File Explorer windows and any programs using the
-card, then dismount each mounted volume instead:
-
-```powershell
-$diskNumber = 1
-Get-Partition -DiskNumber $diskNumber |
-    Where-Object DriveLetter |
-    ForEach-Object { mountvol "$($_.DriveLetter):" /P }
-
-Set-Disk -Number $diskNumber -IsReadOnly $false
-```
-
-This removes the current drive-letter mount points for the card. Reinsert the
-card after writing if Windows does not automatically assign drive letters again.
+For removable media, leave the card online and close File Explorer windows and
+any programs using it. `bim-sync` locks and dismounts the card's volumes only
+while it owns the raw physical-disk handle, then unlocks them when the operation
+finishes. Do not use `mountvol /P`: it leaves the existing partition offline,
+which is not a valid state for raw imaging.
 
 ## Dry-Run Compare
 
@@ -296,8 +279,7 @@ After writing to a fixed disk:
 Set-Disk -Number 1 -IsOffline $false
 ```
 
-For removable media that was dismounted with `mountvol /P`, unplug and reinsert
-the card or assign drive letters again in Disk Management.
+Removable-media volumes are unlocked automatically after the operation.
 
 ## Example Workflow
 
@@ -307,22 +289,19 @@ cargo build --release
 Get-CimInstance Win32_DiskDrive | Select-Object DeviceID,Model,Size
 Get-Disk | Select-Object Number,FriendlyName,Size,BusType,IsBoot,IsSystem
 
-$diskNumber = 1
-Get-Partition -DiskNumber $diskNumber |
-    Where-Object DriveLetter |
-    ForEach-Object { mountvol "$($_.DriveLetter):" /P }
-
-Set-Disk -Number $diskNumber -IsReadOnly $false
-
 .\target\release\bim-sync.exe --image C:\images\sdcard.img --disk 1 --verify-only
 .\target\release\bim-sync.exe --image C:\images\sdcard.img --disk 1
 
-# Reinsert removable media after writing if Windows does not mount it again.
+# For fixed disks, bring the disk online again after writing.
 ```
 
 ## How It Works
 
 For each block:
+
+Before a write, `bim-sync` obtains exclusive locks for all target volumes and
+dismounts them. It retains those locks until the raw-disk handle closes, so
+Windows cannot remount an old filesystem halfway through the image update.
 
 1. Read a block from the image file, or from the selected archive entry.
 2. Read the corresponding block from the target disk.
@@ -350,7 +329,8 @@ different bytes still causes the whole block to be rewritten.
 - The tool operates on raw bytes only.
 - It still reads the full image range.
 - It does not currently zero or truncate data beyond the end of the image.
-- Windows may block raw writes if the disk is online or mounted.
+- Windows will refuse a write if another process keeps a target volume open,
+  preventing `bim-sync` from obtaining an exclusive lock.
 - The tool is Windows-oriented because it targets paths like `\\.\PhysicalDrive1`.
 - Archive auto-detection is extension-based. Use `--archive yes` or
   `--archive no` when the extension is misleading.
@@ -388,7 +368,7 @@ Before writing, confirm:
 - The disk is not your boot/system disk.
 - Important data on the SD card has been backed up.
 - PowerShell or your terminal is running as Administrator.
-- The target disk has been taken offline, or its volumes have been dismounted.
+- File Explorer and other applications are not using the target card.
 
 ## License
 

@@ -255,6 +255,7 @@ struct DiskInfo {
     is_system: bool,
     is_offline: bool,
     is_read_only: bool,
+    has_offline_partition: bool,
     operational_status: String,
     mount_points: Vec<String>,
 }
@@ -978,16 +979,9 @@ fn readiness(state: &GuiState) -> Readiness {
                 can_prepare: true,
             };
         }
-        if disk.is_removable() && !disk.mount_points.is_empty() {
+        if disk.is_removable() && disk.has_offline_partition {
             return Readiness {
-                message: format!(
-                    "Dismount {} before writing. Use Prepare target to dismount mounted removable-media volumes.",
-                    disk.mount_points
-                        .iter()
-                        .map(|mount_point| display_mount_point(mount_point))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
+                message: "A target partition is offline, likely left by an older preparation attempt. Use Prepare target to bring it back online; BIM Sync will lock and dismount it only while writing.".to_owned(),
                 blocking: true,
                 can_start: false,
                 can_prepare: true,
@@ -1010,7 +1004,7 @@ fn readiness(state: &GuiState) -> Readiness {
         )
     } else if state.write_mode {
         format!(
-            "Ready to incrementally sync the image to Disk {} with {} verification.",
+            "Ready to incrementally sync the image to Disk {} with {} verification. Mounted target volumes will be exclusively locked only while BIM Sync is writing.",
             disk.number,
             if state.verify_writes {
                 "read-after-write"
@@ -1367,11 +1361,7 @@ fn run_manual_job(disk: DiskInfo, block_size: u64, sender: mpsc::Sender<WorkerEv
     });
     let result = (|| -> Result<ManualTestSummary> {
         let disk_path = format!(r"\\.\PhysicalDrive{}", disk.number);
-        let mut target = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&disk_path)
-            .with_context(|| format!("Could not open {disk_path} for read/write"))?;
+        let mut target = open_disk(disk.number, &disk_path, false)?;
         run_manual_sd_test(
             &mut target,
             ManualTestOptions {
@@ -1393,7 +1383,7 @@ where
     F: FnMut(SyncEvent),
 {
     let disk_path = format!(r"\\.\PhysicalDrive{}", request.disk.number);
-    let mut disk = open_disk(&disk_path, request.options.verify_only)?;
+    let mut disk = open_disk(request.disk.number, &disk_path, request.options.verify_only)?;
 
     match request.source.kind {
         None => {
@@ -1443,19 +1433,8 @@ where
     }
 }
 
-fn open_disk(path: &str, verify_only: bool) -> Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    if !verify_only {
-        options.write(true);
-    }
-    options.open(path).with_context(|| {
-        if verify_only {
-            format!("Could not open {path} for reading")
-        } else {
-            format!("Could not open {path} for read/write. Prepare the target and run as Administrator.")
-        }
-    })
+fn open_disk(disk_number: u32, path: &str, verify_only: bool) -> Result<RawTargetDisk> {
+    open_raw_target_disk(disk_number, path, !verify_only)
 }
 
 fn sync_gui_reader<I, D, F>(
@@ -1638,7 +1617,8 @@ fn discover_disks() -> Result<Vec<DiskInfo>> {
     let script = r#"
 $disks = @(Get-Disk | ForEach-Object {
     $disk = $_
-    $mountPoints = @(Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue |
+    $partitions = @(Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue)
+    $mountPoints = @($partitions |
         ForEach-Object {
             $driveLetter = [char]$_.DriveLetter
             $mountedPaths = @($_.AccessPaths | Where-Object { [string]$_ -match '^[A-Za-z]:\\' })
@@ -1659,6 +1639,7 @@ $disks = @(Get-Disk | ForEach-Object {
         IsSystem = [bool]$disk.IsSystem
         IsOffline = [bool]$disk.IsOffline
         IsReadOnly = [bool]$disk.IsReadOnly
+        HasOfflinePartition = [bool](@($partitions | Where-Object IsOffline).Count -gt 0)
         OperationalStatus = [string]($disk.OperationalStatus -join ', ')
         MountPoints = $mountPoints
     }
@@ -1683,6 +1664,7 @@ $disks | ConvertTo-Json -Depth 4 -Compress
             is_system: json_bool(record, "IsSystem"),
             is_offline: json_bool(record, "IsOffline"),
             is_read_only: json_bool(record, "IsReadOnly"),
+            has_offline_partition: json_bool(record, "HasOfflinePartition"),
             operational_status: json_string(record, "OperationalStatus"),
             mount_points: record
                 .get("MountPoints")
@@ -1734,7 +1716,7 @@ fn prepare_disk(disk: &DiskInfo) -> Result<String> {
     }
     let script = if disk.is_removable() {
         format!(
-            "$n = {}; Get-Partition -DiskNumber $n -ErrorAction SilentlyContinue | ForEach-Object {{ $mountPoint = @($_.AccessPaths | Where-Object {{ [string]$_ -match '^[A-Za-z]:\\' }} | Select-Object -First 1); if ($mountPoint) {{ mountvol $mountPoint[0] /P; if ($LASTEXITCODE -ne 0) {{ throw \"Could not dismount $($mountPoint[0])\" }} }} }}; Set-Disk -Number $n -IsReadOnly $false -ErrorAction Stop",
+            "$n = {}; Get-Partition -DiskNumber $n -ErrorAction SilentlyContinue | Where-Object IsOffline | Set-Partition -IsOffline $false -ErrorAction Stop; Set-Disk -Number $n -IsReadOnly $false -ErrorAction Stop",
             disk.number
         )
     } else {
@@ -1745,7 +1727,7 @@ fn prepare_disk(disk: &DiskInfo) -> Result<String> {
     };
     run_powershell(&script)?;
     Ok(if disk.is_removable() {
-        format!("Disk {} prepared: mounted volumes were dismounted and read-only mode was cleared. Refresh the disk list before writing.", disk.number)
+        format!("Disk {} prepared: offline partitions were brought online and read-only mode was cleared. BIM Sync will exclusively lock mounted volumes only while writing.", disk.number)
     } else {
         format!(
             "Disk {} prepared: it is offline and writable. Refresh the disk list before writing.",
@@ -1903,6 +1885,7 @@ mod tests {
             is_system: false,
             is_offline: false,
             is_read_only: false,
+            has_offline_partition: false,
             operational_status: "Online".to_owned(),
             mount_points: Vec::new(),
         }
@@ -1954,7 +1937,7 @@ mod tests {
     }
 
     #[test]
-    fn writing_to_a_mounted_removable_target_requires_preparation() {
+    fn writing_to_a_mounted_removable_target_uses_scoped_locking() {
         let mut target = disk();
         target.mount_points = vec![r"E:\".to_owned()];
         let mut state = state_with(target, Some(source(8 * 1024, r"C:\images\card.img")));
@@ -1963,9 +1946,24 @@ mod tests {
 
         let readiness = readiness(&state);
 
+        assert!(readiness.can_start);
+        assert!(!readiness.can_prepare);
+        assert!(readiness.message.contains("exclusively locked"));
+    }
+
+    #[test]
+    fn writing_to_a_removable_target_with_an_offline_partition_requires_recovery() {
+        let mut target = disk();
+        target.has_offline_partition = true;
+        let mut state = state_with(target, Some(source(8 * 1024, r"C:\images\card.img")));
+        state.write_mode = true;
+        state.confirmed = true;
+
+        let readiness = readiness(&state);
+
         assert!(!readiness.can_start);
         assert!(readiness.can_prepare);
-        assert!(readiness.message.contains("Dismount E:"));
+        assert!(readiness.message.contains("offline"));
     }
 
     #[test]
